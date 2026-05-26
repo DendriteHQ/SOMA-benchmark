@@ -49,6 +49,8 @@ OPENCLAW_WS_WATCHDOG_MAX_RETRIES = 5
 OPENCLAW_WS_WATCHDOG_DEFAULT_BACKOFF_SECONDS = 1.0
 OPENCLAW_WS_WATCHDOG_MAX_BACKOFF_SECONDS = 10.0
 OPENCLAW_HEARTBEAT_DISABLED_INTERVAL = "0m"
+OPENCLAW_GATEWAY_PIDS_LIMIT = 4096
+OPENCLAW_GATEWAY_ULIMIT_NOFILE = "4096"
 _PLUGIN_REINSTALLED_FOR_RUNS: set[str] = set()
 _GATEWAY_RECOVERY_LOCK = threading.Lock()
 _GATEWAY_RECOVERY_LOCKS: dict[str, threading.Lock] = {}
@@ -654,14 +656,33 @@ def _resolve_gateway_port(context: RuntimeExecutionContext) -> int:
     return OPENCLAW_GATEWAY_PORT
 
 
-def _resolve_private_network_name(context: RuntimeExecutionContext) -> str:
+def _resolve_requested_private_network_name(context: RuntimeExecutionContext) -> str | None:
     for value in (
         _resolve_runtime_option(context, "openclaw_private_network_name"),
         os.getenv("SOMA_OPENCLAW_PRIVATE_NETWORK_NAME"),
     ):
         if isinstance(value, str) and value.strip():
             return value.strip()
-    return "bridge"
+    return None
+
+
+def _resolve_private_network_name(context: RuntimeExecutionContext) -> str:
+    requested_name = _resolve_requested_private_network_name(context)
+    if requested_name is not None:
+        return requested_name
+    digest = hashlib.sha256(str(context.output_dir.resolve()).encode("utf-8")).hexdigest()[:12]
+    return f"soma-openclaw-net-{digest}"
+
+
+def _openclaw_container_hardening_args() -> list[str]:
+    return [
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        str(OPENCLAW_GATEWAY_PIDS_LIMIT),
+        "--ulimit",
+        f"nofile={OPENCLAW_GATEWAY_ULIMIT_NOFILE}:{OPENCLAW_GATEWAY_ULIMIT_NOFILE}",
+    ]
 
 
 def _resolve_agent_args(context: RuntimeExecutionContext) -> list[str]:
@@ -742,6 +763,12 @@ def _docker_remove_container(name: str) -> None:
     _run_command(["docker", "rm", "-f", name])
 
 
+def _docker_remove_network(name: str) -> None:
+    if name in {"", "bridge", "host", "none"}:
+        return
+    _run_command(["docker", "network", "rm", name])
+
+
 def _docker_list_container_ids_by_label(label: str) -> list[str]:
     result = _run_command(["docker", "ps", "-aq", "--filter", f"label={label}"])
     if result.returncode != 0:
@@ -765,6 +792,27 @@ def _reset_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _ensure_private_network(context: RuntimeExecutionContext) -> tuple[str, bool]:
+    name = _resolve_private_network_name(context)
+    if name in {"", "bridge", "host", "none"}:
+        return name, False
+    if _run_command(["docker", "network", "inspect", name]).returncode == 0:
+        return name, False
+    create = _run_command(["docker", "network", "create", name])
+    if create.returncode != 0 and _run_command(["docker", "network", "inspect", name]).returncode != 0:
+        raise RuntimeError(
+            "Failed to create the private OpenClaw network "
+            f"{name!r}: {(create.stderr or create.stdout or '').strip()}"
+        )
+    return name, True
+
+
+def _teardown_private_network(context: RuntimeExecutionContext) -> None:
+    if _resolve_requested_private_network_name(context) is not None:
+        return
+    _docker_remove_network(_resolve_private_network_name(context))
+
+
 def _materialize_host_repo_from_benchmark_image(context: RuntimeExecutionContext) -> None:
     repo_dir = _repo_dir(context)
     _reset_directory(repo_dir)
@@ -773,6 +821,10 @@ def _materialize_host_repo_from_benchmark_image(context: RuntimeExecutionContext
         "docker",
         "run",
         "--rm",
+        "--network",
+        "none",
+        "--security-opt",
+        "no-new-privileges",
         "--entrypoint",
         "sh",
     ]
@@ -1822,6 +1874,7 @@ def _cli_base_args(context: RuntimeExecutionContext, *, gateway_name: str) -> li
         "-v",
         f"{state_dir}:{OPENCLAW_CONTAINER_STATE_DIR}",
     ]
+    args.extend(_openclaw_container_hardening_args())
     args.extend(_plugin_mount_args(context))
     args.extend(_docker_socket_mount_args(user_spec=openclaw_user))
     docker_binary = _host_docker_binary()
@@ -1860,6 +1913,7 @@ def _start_gateway_container(
     _ensure_docker_image_available(_resolve_gateway_image(context), role="OpenClaw gateway")
     state_dir = _state_dir(context)
     problems_root = _gateway_workspace_root(context)
+    network_name, network_created = _ensure_private_network(context)
     openclaw_user = _resolve_openclaw_user(context)
     state_dir.mkdir(parents=True, exist_ok=True)
     problems_root.mkdir(parents=True, exist_ok=True)
@@ -1873,12 +1927,13 @@ def _start_gateway_container(
         "--name",
         gateway_name,
         "--network",
-        _resolve_private_network_name(context),
+        network_name,
         "-v",
         f"{state_dir}:{OPENCLAW_CONTAINER_STATE_DIR}",
         "-v",
         f"{problems_root}:{OPENCLAW_CONTAINER_PROBLEMS_ROOT}",
     ]
+    args.extend(_openclaw_container_hardening_args())
     args.extend(_docker_socket_mount_args(user_spec=openclaw_user))
     if str(problems_root) != OPENCLAW_CONTAINER_PROBLEMS_ROOT:
         args.extend(["-v", f"{problems_root}:{problems_root}"])
@@ -1902,6 +1957,8 @@ def _start_gateway_container(
     )
     result = _run_command(args)
     if result.returncode != 0:
+        if network_created:
+            _docker_remove_network(network_name)
         raise RuntimeError(
             "Failed to start the shared OpenClaw gateway container: "
             f"{(result.stderr or result.stdout or '').strip()}"
@@ -2320,6 +2377,7 @@ def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionR
     finally:
         if gateway_started and not keep_gateway:
             _docker_remove_container(gateway_name)
+            _teardown_private_network(context)
 
 
 def run_openclaw_batch(
@@ -2411,6 +2469,7 @@ def run_openclaw_batch(
     finally:
         if gateway_started and not keep_gateway:
             _docker_remove_container(gateway_name)
+            _teardown_private_network(primary)
 
 
 OPENCLAW_BACKEND = RuntimeBackend(

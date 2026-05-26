@@ -355,7 +355,13 @@ def _resolve_requested_openclaw_user(context: RuntimeExecutionContext) -> str | 
 
 def _resolve_openclaw_user(context: RuntimeExecutionContext) -> str:
     requested_user = _resolve_requested_openclaw_user(context)
-    return requested_user or "root"
+    if requested_user is not None:
+        return requested_user
+    raise RuntimeError(
+        "OpenClaw requires an explicit gateway/CLI container user. "
+        "Set openclaw_user or openclaw_container_user (CLI: --openclaw-current-user) "
+        "or provide SOMA_OPENCLAW_USER / SOMA_OPENCLAW_CONTAINER_USER."
+    )
 
 
 def _resolve_workspace_container_user(context: RuntimeExecutionContext) -> str | None:

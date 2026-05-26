@@ -23,7 +23,7 @@ def _build_runtime_options(
     *,
     openclaw_command: str | None,
     openclaw_container_image: str | None,
-    openclaw_user: str | None,
+    openclaw_current_user: bool,
     openclaw_run_id_header_value: str | None,
     openclaw_ignore_api_key: bool,
     openclaw_plugin_path: str | None,
@@ -43,8 +43,8 @@ def _build_runtime_options(
         runtime_options["openclaw_command"] = openclaw_command
     if openclaw_container_image:
         runtime_options["openclaw_container_image"] = openclaw_container_image
-    if openclaw_user:
-        runtime_options["openclaw_user"] = openclaw_user
+    if openclaw_current_user:
+        runtime_options["openclaw_user"] = "current"
     if openclaw_run_id_header_value:
         runtime_options["openclaw_run_id_header_value"] = openclaw_run_id_header_value
     if openclaw_ignore_api_key:
@@ -175,12 +175,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional Docker image override for the shared OpenClaw gateway and CLI sidecars.",
     )
     parser.add_argument(
-        "--openclaw-user",
-        default=None,
+        "--openclaw-current-user",
+        action="store_true",
         help=(
-            "Optional Docker --user value for OpenClaw gateway and CLI containers. "
-            "Use `current` to run them as the invoking host uid:gid instead of root."
+            "Run OpenClaw gateway and CLI containers as the invoking host uid:gid. "
+            "Required unless provided via SOMA_OPENCLAW_USER or SOMA_OPENCLAW_CONTAINER_USER."
         ),
+    )
+    parser.add_argument(
+        "--openclaw-user",
+        choices=["current"],
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--openclaw-ignore-api-key",
@@ -258,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_options = _build_runtime_options(
         openclaw_command=args.openclaw_command,
         openclaw_container_image=args.openclaw_container_image,
-        openclaw_user=args.openclaw_user,
+        openclaw_current_user=(args.openclaw_current_user or args.openclaw_user == "current"),
         openclaw_run_id_header_value=None,
         openclaw_ignore_api_key=args.openclaw_ignore_api_key,
         openclaw_plugin_path=args.openclaw_plugin_path,

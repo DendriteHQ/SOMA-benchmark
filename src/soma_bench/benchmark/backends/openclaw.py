@@ -946,14 +946,11 @@ def _ensure_plugin_runtime(context: RuntimeExecutionContext) -> dict[str, Any]:
                 "fi"
             ),
             f"cd {shlex.quote(_container_plugin_path())}",
-            f"python3 -m venv {shlex.quote(PLUGIN_VENV_DIRNAME)}",
+            f"rm -rf {shlex.quote(PLUGIN_VENV_DIRNAME)}",
+            f"python3 -m venv --clear {shlex.quote(PLUGIN_VENV_DIRNAME)}",
             (
                 f"{shlex.quote(PLUGIN_VENV_DIRNAME)}/bin/python "
-                "-m pip install --upgrade pip"
-            ),
-            (
-                f"{shlex.quote(PLUGIN_VENV_DIRNAME)}/bin/python "
-                "-m pip install -r requirements.txt"
+                "-m pip install --disable-pip-version-check --no-cache-dir -r requirements.txt"
             ),
             (
                 "printf '%s\\n' "

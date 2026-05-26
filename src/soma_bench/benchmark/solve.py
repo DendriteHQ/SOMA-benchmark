@@ -154,12 +154,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--openclaw-user",
-        choices=["current"],
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
         "--openclaw-run-id-header-value",
         default=None,
         help="Optional value sent as X-Run-Id on OpenClaw upstream model calls.",
@@ -279,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_options = _build_runtime_options(
         openclaw_command=args.openclaw_command,
         openclaw_container_image=args.openclaw_container_image,
-        openclaw_current_user=(args.openclaw_current_user or args.openclaw_user == "current"),
+        openclaw_current_user=args.openclaw_current_user,
         openclaw_run_id_header_value=args.openclaw_run_id_header_value,
         openclaw_ignore_api_key=args.openclaw_ignore_api_key,
         openclaw_plugin_path=args.openclaw_plugin_path,

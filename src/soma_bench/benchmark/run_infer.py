@@ -183,12 +183,6 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--openclaw-user",
-        choices=["current"],
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
         "--openclaw-ignore-api-key",
         action="store_true",
         help="Skip local LLM API key validation and do not forward API key credentials to OpenClaw. Use when the upstream gateway resolves auth from X-Run-Id.",
@@ -264,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_options = _build_runtime_options(
         openclaw_command=args.openclaw_command,
         openclaw_container_image=args.openclaw_container_image,
-        openclaw_current_user=(args.openclaw_current_user or args.openclaw_user == "current"),
+        openclaw_current_user=args.openclaw_current_user,
         openclaw_run_id_header_value=None,
         openclaw_ignore_api_key=args.openclaw_ignore_api_key,
         openclaw_plugin_path=args.openclaw_plugin_path,

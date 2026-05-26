@@ -49,6 +49,8 @@ OPENCLAW_WS_WATCHDOG_MAX_RETRIES = 5
 OPENCLAW_WS_WATCHDOG_DEFAULT_BACKOFF_SECONDS = 1.0
 OPENCLAW_WS_WATCHDOG_MAX_BACKOFF_SECONDS = 10.0
 OPENCLAW_HEARTBEAT_DISABLED_INTERVAL = "0m"
+OPENCLAW_GATEWAY_PIDS_LIMIT = 4096
+OPENCLAW_GATEWAY_ULIMIT_NOFILE = "4096"
 _PLUGIN_REINSTALLED_FOR_RUNS: set[str] = set()
 _GATEWAY_RECOVERY_LOCK = threading.Lock()
 _GATEWAY_RECOVERY_LOCKS: dict[str, threading.Lock] = {}
@@ -56,6 +58,7 @@ _WS_CLOSE_RE = re.compile(
     r"gateway closed \((?P<code>\d{3,4})\s+(?P<reason>[^)]*)\)",
     re.IGNORECASE,
 )
+_DOCKER_NUMERIC_USER_RE = re.compile(r"^\d+(?::\d+)?$")
 
 
 def _run_command(
@@ -71,6 +74,28 @@ def _host_docker_binary() -> str | None:
     if docker_binary and os.path.isabs(docker_binary):
         return docker_binary
     return None
+
+
+def _docker_user_is_root(user_spec: str) -> bool:
+    normalized = user_spec.strip().lower()
+    return normalized in {"root", "0", "0:0"}
+
+
+def _docker_socket_mount_args(*, user_spec: str) -> list[str]:
+    docker_sock = "/var/run/docker.sock"
+    if not os.path.exists(docker_sock):
+        return []
+
+    args = ["-v", f"{docker_sock}:{docker_sock}"]
+    if _docker_user_is_root(user_spec):
+        return args
+
+    try:
+        docker_sock_gid = os.stat(docker_sock).st_gid
+    except OSError:
+        return args
+
+    return ["--group-add", str(docker_sock_gid), *args]
 
 
 def _runtime_option_name_candidates(name: str) -> tuple[str, ...]:
@@ -308,6 +333,89 @@ def _resolve_keep_gateway_enabled(context: RuntimeExecutionContext) -> bool:
 
     env_value = os.getenv("SOMA_OPENCLAW_KEEP_GATEWAY")
     return _coerce_bool_option(env_value) or False
+
+
+def _resolve_requested_openclaw_user(context: RuntimeExecutionContext) -> str | None:
+    for value in (
+        _resolve_runtime_option(context, "openclaw_user"),
+        _resolve_runtime_option(context, "openclaw_container_user"),
+        os.getenv("SOMA_OPENCLAW_USER"),
+        os.getenv("SOMA_OPENCLAW_CONTAINER_USER"),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            continue
+        normalized = value.strip()
+        if normalized.lower() == "current":
+            if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
+                raise RuntimeError("openclaw_user=current is not supported on this platform")
+            return f"{os.getuid()}:{os.getgid()}"
+        return normalized
+    return None
+
+
+def _resolve_openclaw_user(context: RuntimeExecutionContext) -> str:
+    requested_user = _resolve_requested_openclaw_user(context)
+    if requested_user is not None:
+        return requested_user
+    raise RuntimeError(
+        "OpenClaw requires an explicit gateway/CLI container user. "
+        "Set openclaw_user or openclaw_container_user (CLI: --openclaw-current-user) "
+        "or provide SOMA_OPENCLAW_USER / SOMA_OPENCLAW_CONTAINER_USER."
+    )
+
+
+def _resolve_workspace_container_user(context: RuntimeExecutionContext) -> str | None:
+    requested_user = _resolve_requested_openclaw_user(context)
+    if requested_user is None:
+        return None
+    if requested_user.lower() == "root" or _DOCKER_NUMERIC_USER_RE.fullmatch(requested_user):
+        return requested_user
+    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+        return f"{os.getuid()}:{os.getgid()}"
+    return requested_user
+
+
+def _path_owner_spec(path: Path) -> str:
+    stat_result = path.stat()
+    return f"{stat_result.st_uid}:{stat_result.st_gid}"
+
+
+def _remove_plugin_venv(
+    context: RuntimeExecutionContext,
+    *,
+    plugin_path: Path,
+    venv_path: Path,
+) -> None:
+    if not venv_path.exists():
+        return
+    try:
+        shutil.rmtree(venv_path)
+        return
+    except PermissionError:
+        pass
+
+    relative_venv_path = venv_path.resolve().relative_to(plugin_path.resolve())
+    container_venv_path = Path(_container_plugin_path()) / relative_venv_path
+    cleanup_result = _run_command(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            "root",
+            "-v",
+            f"{plugin_path}:{_container_plugin_path()}:rw",
+            _resolve_gateway_image(context),
+            "sh",
+            "-lc",
+            f"rm -rf {shlex.quote(str(container_venv_path))}",
+        ]
+    )
+    if cleanup_result.returncode != 0:
+        raise RuntimeError(
+            "Failed to remove the OpenClaw SOMA plugin runtime before reinstall. "
+            f"{(cleanup_result.stderr or cleanup_result.stdout or '').strip()}"
+        )
 
 
 def _resolve_ws_watchdog_retries(context: RuntimeExecutionContext) -> int:
@@ -554,14 +662,33 @@ def _resolve_gateway_port(context: RuntimeExecutionContext) -> int:
     return OPENCLAW_GATEWAY_PORT
 
 
-def _resolve_private_network_name(context: RuntimeExecutionContext) -> str:
+def _resolve_requested_private_network_name(context: RuntimeExecutionContext) -> str | None:
     for value in (
         _resolve_runtime_option(context, "openclaw_private_network_name"),
         os.getenv("SOMA_OPENCLAW_PRIVATE_NETWORK_NAME"),
     ):
         if isinstance(value, str) and value.strip():
             return value.strip()
-    return "bridge"
+    return None
+
+
+def _resolve_private_network_name(context: RuntimeExecutionContext) -> str:
+    requested_name = _resolve_requested_private_network_name(context)
+    if requested_name is not None:
+        return requested_name
+    digest = hashlib.sha256(str(context.output_dir.resolve()).encode("utf-8")).hexdigest()[:12]
+    return f"soma-openclaw-net-{digest}"
+
+
+def _openclaw_container_hardening_args() -> list[str]:
+    return [
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        str(OPENCLAW_GATEWAY_PIDS_LIMIT),
+        "--ulimit",
+        f"nofile={OPENCLAW_GATEWAY_ULIMIT_NOFILE}:{OPENCLAW_GATEWAY_ULIMIT_NOFILE}",
+    ]
 
 
 def _resolve_agent_args(context: RuntimeExecutionContext) -> list[str]:
@@ -642,6 +769,12 @@ def _docker_remove_container(name: str) -> None:
     _run_command(["docker", "rm", "-f", name])
 
 
+def _docker_remove_network(name: str) -> None:
+    if name in {"", "bridge", "host", "none"}:
+        return
+    _run_command(["docker", "network", "rm", name])
+
+
 def _docker_list_container_ids_by_label(label: str) -> list[str]:
     result = _run_command(["docker", "ps", "-aq", "--filter", f"label={label}"])
     if result.returncode != 0:
@@ -665,28 +798,59 @@ def _reset_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _ensure_private_network(context: RuntimeExecutionContext) -> tuple[str, bool]:
+    name = _resolve_private_network_name(context)
+    if name in {"", "bridge", "host", "none"}:
+        return name, False
+    if _run_command(["docker", "network", "inspect", name]).returncode == 0:
+        return name, False
+    create = _run_command(["docker", "network", "create", name])
+    if create.returncode != 0 and _run_command(["docker", "network", "inspect", name]).returncode != 0:
+        raise RuntimeError(
+            "Failed to create the private OpenClaw network "
+            f"{name!r}: {(create.stderr or create.stdout or '').strip()}"
+        )
+    return name, True
+
+
+def _teardown_private_network(context: RuntimeExecutionContext) -> None:
+    if _resolve_requested_private_network_name(context) is not None:
+        return
+    _docker_remove_network(_resolve_private_network_name(context))
+
+
 def _materialize_host_repo_from_benchmark_image(context: RuntimeExecutionContext) -> None:
     repo_dir = _repo_dir(context)
     _reset_directory(repo_dir)
 
-    result = _run_command(
+    args = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--security-opt",
+        "no-new-privileges",
+        "--entrypoint",
+        "sh",
+    ]
+    workspace_user = _resolve_workspace_container_user(context)
+    if workspace_user is not None:
+        args.extend(["--user", workspace_user])
+    args.extend(
         [
-            "docker",
-            "run",
-            "--rm",
-            "--entrypoint",
-            "sh",
             "-v",
             f"{repo_dir.resolve()}:/out:rw",
             _resolve_benchmark_image(context),
             "-lc",
             (
                 "if [ -d /testbed ]; then "
-                "cp -a /testbed/. /out/; "
+                "cp -a --no-preserve=ownership /testbed/. /out/; "
                 "else echo 'OpenClaw sandbox expected /testbed in the benchmark image' >&2; exit 1; fi"
             ),
         ]
     )
+    result = _run_command(args)
     if result.returncode != 0:
         message = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"Failed to materialize benchmark repository into host workspace: {message}")
@@ -747,8 +911,7 @@ def _ensure_plugin_runtime(context: RuntimeExecutionContext) -> dict[str, Any]:
     reinstall_requested = _resolve_plugin_reinstall_on_run_start(context)
     reinstall_performed = False
     if reinstall_requested and run_key not in _PLUGIN_REINSTALLED_FOR_RUNS:
-        if venv_path.exists():
-            shutil.rmtree(venv_path)
+        _remove_plugin_venv(context, plugin_path=plugin_path, venv_path=venv_path)
         reinstall_performed = True
     if (venv_path / "bin" / "python").is_file() and marker_path.is_file():
         if marker_path.read_text(encoding="utf-8").strip() == digest:
@@ -764,6 +927,7 @@ def _ensure_plugin_runtime(context: RuntimeExecutionContext) -> dict[str, Any]:
                 "reinstall_performed": False,
             }
 
+    plugin_owner = _path_owner_spec(plugin_path)
     install_script = "\n".join(
         [
             "set -e",
@@ -796,6 +960,7 @@ def _ensure_plugin_runtime(context: RuntimeExecutionContext) -> dict[str, Any]:
                 f"{shlex.quote(digest)} "
                 f"> {shlex.quote(PLUGIN_VENV_DIRNAME)}/{PLUGIN_REQUIREMENTS_MARKER}"
             ),
+            f"chown -R {shlex.quote(plugin_owner)} {shlex.quote(PLUGIN_VENV_DIRNAME)}",
         ]
     )
     args = [
@@ -1519,6 +1684,9 @@ def _build_agent_entry(context: RuntimeExecutionContext) -> dict[str, Any]:
             },
         },
     }
+    workspace_user = _resolve_workspace_container_user(context)
+    if workspace_user is not None:
+        agent_entry["sandbox"]["docker"]["user"] = workspace_user
     agent_entry["sandbox"]["docker"]["setupCommand"] = _build_prepare_repo_command(context)
     return agent_entry
 
@@ -1700,20 +1868,21 @@ def _build_message(context: RuntimeExecutionContext, *, repo_path: str) -> str:
 
 def _cli_base_args(context: RuntimeExecutionContext, *, gateway_name: str) -> list[str]:
     state_dir = _state_dir(context)
+    openclaw_user = _resolve_openclaw_user(context)
     args = [
         "docker",
         "run",
         "--rm",
         "--user",
-        "root",
+        openclaw_user,
         "--network",
         f"container:{gateway_name}",
         "-v",
         f"{state_dir}:{OPENCLAW_CONTAINER_STATE_DIR}",
     ]
+    args.extend(_openclaw_container_hardening_args())
     args.extend(_plugin_mount_args(context))
-    if os.path.exists("/var/run/docker.sock"):
-        args.extend(["-v", "/var/run/docker.sock:/var/run/docker.sock"])
+    args.extend(_docker_socket_mount_args(user_spec=openclaw_user))
     docker_binary = _host_docker_binary()
     if docker_binary:
         args.extend(["-v", f"{docker_binary}:/usr/local/bin/docker:ro"])
@@ -1750,6 +1919,8 @@ def _start_gateway_container(
     _ensure_docker_image_available(_resolve_gateway_image(context), role="OpenClaw gateway")
     state_dir = _state_dir(context)
     problems_root = _gateway_workspace_root(context)
+    network_name, network_created = _ensure_private_network(context)
+    openclaw_user = _resolve_openclaw_user(context)
     state_dir.mkdir(parents=True, exist_ok=True)
     problems_root.mkdir(parents=True, exist_ok=True)
     args = [
@@ -1758,18 +1929,18 @@ def _start_gateway_container(
         "-d",
         "--rm",
         "--user",
-        "root",
+        openclaw_user,
         "--name",
         gateway_name,
         "--network",
-        _resolve_private_network_name(context),
+        network_name,
         "-v",
         f"{state_dir}:{OPENCLAW_CONTAINER_STATE_DIR}",
         "-v",
         f"{problems_root}:{OPENCLAW_CONTAINER_PROBLEMS_ROOT}",
-        "-v",
-        "/var/run/docker.sock:/var/run/docker.sock",
     ]
+    args.extend(_openclaw_container_hardening_args())
+    args.extend(_docker_socket_mount_args(user_spec=openclaw_user))
     if str(problems_root) != OPENCLAW_CONTAINER_PROBLEMS_ROOT:
         args.extend(["-v", f"{problems_root}:{problems_root}"])
     args.extend(_plugin_mount_args(context))
@@ -1792,6 +1963,8 @@ def _start_gateway_container(
     )
     result = _run_command(args)
     if result.returncode != 0:
+        if network_created:
+            _docker_remove_network(network_name)
         raise RuntimeError(
             "Failed to start the shared OpenClaw gateway container: "
             f"{(result.stderr or result.stdout or '').strip()}"
@@ -2210,6 +2383,7 @@ def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionR
     finally:
         if gateway_started and not keep_gateway:
             _docker_remove_container(gateway_name)
+            _teardown_private_network(context)
 
 
 def run_openclaw_batch(
@@ -2301,6 +2475,7 @@ def run_openclaw_batch(
     finally:
         if gateway_started and not keep_gateway:
             _docker_remove_container(gateway_name)
+            _teardown_private_network(primary)
 
 
 OPENCLAW_BACKEND = RuntimeBackend(

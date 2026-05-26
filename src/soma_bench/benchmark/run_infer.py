@@ -23,6 +23,7 @@ def _build_runtime_options(
     *,
     openclaw_command: str | None,
     openclaw_container_image: str | None,
+    openclaw_user: str | None,
     openclaw_run_id_header_value: str | None,
     openclaw_ignore_api_key: bool,
     openclaw_plugin_path: str | None,
@@ -42,6 +43,8 @@ def _build_runtime_options(
         runtime_options["openclaw_command"] = openclaw_command
     if openclaw_container_image:
         runtime_options["openclaw_container_image"] = openclaw_container_image
+    if openclaw_user:
+        runtime_options["openclaw_user"] = openclaw_user
     if openclaw_run_id_header_value:
         runtime_options["openclaw_run_id_header_value"] = openclaw_run_id_header_value
     if openclaw_ignore_api_key:
@@ -172,6 +175,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional Docker image override for the shared OpenClaw gateway and CLI sidecars.",
     )
     parser.add_argument(
+        "--openclaw-user",
+        default=None,
+        help=(
+            "Optional Docker --user value for OpenClaw gateway and CLI containers. "
+            "Use `current` to run them as the invoking host uid:gid instead of root."
+        ),
+    )
+    parser.add_argument(
         "--openclaw-ignore-api-key",
         action="store_true",
         help="Skip local LLM API key validation and do not forward API key credentials to OpenClaw. Use when the upstream gateway resolves auth from X-Run-Id.",
@@ -247,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_options = _build_runtime_options(
         openclaw_command=args.openclaw_command,
         openclaw_container_image=args.openclaw_container_image,
+        openclaw_user=args.openclaw_user,
         openclaw_run_id_header_value=None,
         openclaw_ignore_api_key=args.openclaw_ignore_api_key,
         openclaw_plugin_path=args.openclaw_plugin_path,

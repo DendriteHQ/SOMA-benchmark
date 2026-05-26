@@ -146,6 +146,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional Docker image override for the shared OpenClaw gateway and CLI sidecars.",
     )
     parser.add_argument(
+        "--openclaw-user",
+        default=None,
+        help=(
+            "Optional Docker --user value for OpenClaw gateway and CLI containers. "
+            "Use `current` to run them as the invoking host uid:gid instead of root."
+        ),
+    )
+    parser.add_argument(
         "--openclaw-run-id-header-value",
         default=None,
         help="Optional value sent as X-Run-Id on OpenClaw upstream model calls.",
@@ -265,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_options = _build_runtime_options(
         openclaw_command=args.openclaw_command,
         openclaw_container_image=args.openclaw_container_image,
+        openclaw_user=args.openclaw_user,
         openclaw_run_id_header_value=args.openclaw_run_id_header_value,
         openclaw_ignore_api_key=args.openclaw_ignore_api_key,
         openclaw_plugin_path=args.openclaw_plugin_path,

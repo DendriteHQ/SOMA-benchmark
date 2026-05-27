@@ -1874,6 +1874,8 @@ def _build_provider_config(context: RuntimeExecutionContext) -> dict[str, Any]:
             "baseUrl": base_url or "https://api.openai.com/v1",
             "models": [{"id": model_id, "name": model_id}] if model_id else [],
         }
+        if use_openai_proxy_without_api_key:
+            openai_provider["request"] = {"allowPrivateNetwork": True}
         if api_key:
             openai_provider["apiKey"] = "${OPENAI_API_KEY}"
         elif use_openai_proxy_without_api_key:

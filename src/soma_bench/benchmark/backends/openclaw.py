@@ -31,6 +31,10 @@ OPENCLAW_GATEWAY_IMAGE = "alpine/openclaw:latest"
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_GATEWAY_START_RETRIES = 20
 OPENCLAW_GATEWAY_START_SLEEP_SECONDS = 0.5
+OPENCLAW_DIND_IMAGE = "docker:dind"
+OPENCLAW_DIND_PORT = 2375
+OPENCLAW_DIND_START_RETRIES = 60
+OPENCLAW_DIND_START_SLEEP_SECONDS = 0.5
 OPENCLAW_GATEWAY_STATE_DIRNAME = "openclaw-gateway-state"
 OPENCLAW_PROBLEMS_DIRNAME = "openclaw-problems"
 OPENCLAW_CONTAINER_ARTIFACTS_PATH = "/artifacts"
@@ -670,6 +674,16 @@ def _resolve_gateway_port(context: RuntimeExecutionContext) -> int:
     return OPENCLAW_GATEWAY_PORT
 
 
+def _resolve_dind_image(context: RuntimeExecutionContext) -> str:
+    for value in (
+        _resolve_runtime_option(context, "openclaw_dind_image"),
+        os.getenv("SOMA_OPENCLAW_DIND_IMAGE"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return OPENCLAW_DIND_IMAGE
+
+
 def _resolve_requested_private_network_name(context: RuntimeExecutionContext) -> str | None:
     for value in (
         _resolve_runtime_option(context, "openclaw_private_network_name"),
@@ -686,6 +700,18 @@ def _resolve_private_network_name(context: RuntimeExecutionContext) -> str:
         return requested_name
     digest = hashlib.sha256(str(context.output_dir.resolve()).encode("utf-8")).hexdigest()[:12]
     return f"soma-openclaw-net-{digest}"
+
+
+def _resolve_isolated_control_network_name(context: RuntimeExecutionContext) -> str:
+    return f"{_resolve_gateway_name(context)}-control"
+
+
+def _dind_container_name(context: RuntimeExecutionContext) -> str:
+    return f"{_resolve_gateway_name(context)}-dind"
+
+
+def _isolated_docker_host(context: RuntimeExecutionContext) -> str:
+    return f"tcp://{_dind_container_name(context)}:{OPENCLAW_DIND_PORT}"
 
 
 def _openclaw_container_hardening_args() -> list[str]:
@@ -790,12 +816,77 @@ def _docker_list_container_ids_by_label(label: str) -> list[str]:
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
 
+def _docker_network_contains_container(network_name: str, container_name: str) -> bool:
+    inspect_result = _run_command(["docker", "network", "inspect", network_name])
+    if inspect_result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(inspect_result.stdout or "[]")
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+        return False
+    containers = payload[0].get("Containers")
+    if not isinstance(containers, dict):
+        return False
+    return any(
+        isinstance(entry, dict) and entry.get("Name") == container_name
+        for entry in containers.values()
+    )
+
+
+def _docker_connect_container_to_network(*, container_name: str, network_name: str) -> None:
+    if _docker_network_contains_container(network_name, container_name):
+        return
+    result = _run_command(["docker", "network", "connect", network_name, container_name])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to connect container {container_name!r} to Docker network {network_name!r}: "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+
+
+def _run_isolated_docker_command(
+    context: RuntimeExecutionContext,
+    args: list[str],
+) -> subprocess.CompletedProcess[str]:
+    return _run_command(["docker", "exec", _dind_container_name(context), "docker", *args])
+
+
+def _isolated_docker_list_container_ids_by_label(
+    context: RuntimeExecutionContext,
+    label: str,
+) -> list[str]:
+    result = _run_isolated_docker_command(context, ["ps", "-aq", "--filter", f"label={label}"])
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def _isolated_docker_remove_container(context: RuntimeExecutionContext, name: str) -> None:
+    _run_isolated_docker_command(context, ["rm", "-f", name])
+
+
 def _build_sandbox_session_key(*, agent_id: str, session_id: str) -> str:
     return f"agent:{agent_id}:explicit:{session_id}"
 
 
-def _cleanup_sandbox_containers(*, agent_id: str, session_id: str) -> None:
+def _cleanup_sandbox_containers(
+    context: RuntimeExecutionContext,
+    *,
+    agent_id: str,
+    session_id: str,
+) -> None:
     session_key = _build_sandbox_session_key(agent_id=agent_id, session_id=session_id)
+    if _docker_container_running(_dind_container_name(context)):
+        container_ids = _isolated_docker_list_container_ids_by_label(
+            context,
+            f"openclaw.sessionKey={session_key}",
+        )
+        for container_id in container_ids:
+            _isolated_docker_remove_container(context, container_id)
+        return
+
     for container_id in _docker_list_container_ids_by_label(f"openclaw.sessionKey={session_key}"):
         _docker_remove_container(container_id)
 
@@ -821,10 +912,139 @@ def _ensure_private_network(context: RuntimeExecutionContext) -> tuple[str, bool
     return name, True
 
 
+def _ensure_isolated_control_network(context: RuntimeExecutionContext) -> tuple[str, bool]:
+    name = _resolve_isolated_control_network_name(context)
+    if _run_command(["docker", "network", "inspect", name]).returncode == 0:
+        return name, False
+    create = _run_command(["docker", "network", "create", "--internal", name])
+    if create.returncode != 0 and _run_command(["docker", "network", "inspect", name]).returncode != 0:
+        raise RuntimeError(
+            "Failed to create the isolated OpenClaw control network "
+            f"{name!r}: {(create.stderr or create.stdout or '').strip()}"
+        )
+    return name, True
+
+
+def _ensure_isolated_sandbox_network(context: RuntimeExecutionContext) -> None:
+    name = _resolve_private_network_name(context)
+    if name in {"", "none", "bridge", "host"}:
+        return
+
+    inspect = _run_isolated_docker_command(context, ["network", "inspect", name])
+    if inspect.returncode == 0:
+        return
+
+    create = _run_isolated_docker_command(context, ["network", "create", "--internal", name])
+    if create.returncode != 0 and _run_isolated_docker_command(context, ["network", "inspect", name]).returncode != 0:
+        raise RuntimeError(
+            "Failed to create the isolated OpenClaw sandbox network "
+            f"{name!r}: {(create.stderr or create.stdout or '').strip()}"
+        )
+
+
 def _teardown_private_network(context: RuntimeExecutionContext) -> None:
     if _resolve_requested_private_network_name(context) is not None:
         return
     _docker_remove_network(_resolve_private_network_name(context))
+
+
+def _teardown_isolated_control_network(context: RuntimeExecutionContext) -> None:
+    _docker_remove_network(_resolve_isolated_control_network_name(context))
+
+
+def _wait_for_isolated_daemon_ready(*, dind_name: str) -> None:
+    last_error = ""
+    for _ in range(OPENCLAW_DIND_START_RETRIES):
+        if not _docker_container_running(dind_name):
+            logs = _run_command(["docker", "logs", dind_name])
+            raise RuntimeError(
+                "OpenClaw isolated Docker daemon exited before becoming ready: "
+                f"{(logs.stderr or logs.stdout or '').strip()}"
+            )
+        probe = _run_command(["docker", "exec", dind_name, "docker", "info"])
+        if probe.returncode == 0:
+            return
+        last_error = (probe.stderr or probe.stdout or "").strip()
+        time.sleep(OPENCLAW_DIND_START_SLEEP_SECONDS)
+    raise RuntimeError(f"OpenClaw isolated Docker daemon did not become ready: {last_error}")
+
+
+def _ensure_isolated_daemon(context: RuntimeExecutionContext) -> str:
+    network_name, network_created = _ensure_isolated_control_network(context)
+
+    dind_name = _dind_container_name(context)
+    if _docker_container_running(dind_name):
+        _ensure_isolated_sandbox_network(context)
+        return _isolated_docker_host(context)
+
+    _docker_remove_container(dind_name)
+    _ensure_docker_image_available(_resolve_dind_image(context), role="OpenClaw isolated Docker daemon")
+    args = [
+        "docker",
+        "run",
+        "-d",
+        "--rm",
+        "--privileged",
+        "--name",
+        dind_name,
+        "--network",
+        network_name,
+        "-e",
+        "DOCKER_TLS_CERTDIR=",
+        _resolve_dind_image(context),
+    ]
+    result = _run_command(args)
+    if result.returncode != 0:
+        if network_created:
+            _docker_remove_network(network_name)
+        raise RuntimeError(
+            "Failed to start the OpenClaw isolated Docker daemon: "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+
+    _wait_for_isolated_daemon_ready(dind_name=dind_name)
+    _ensure_isolated_sandbox_network(context)
+    return _isolated_docker_host(context)
+
+
+def _teardown_isolated_daemon(context: RuntimeExecutionContext) -> None:
+    _docker_remove_container(_dind_container_name(context))
+
+
+def _ensure_image_in_isolated_daemon(
+    context: RuntimeExecutionContext,
+    image: str,
+    *,
+    role: str,
+) -> None:
+    _ensure_isolated_daemon(context)
+    dind_name = _dind_container_name(context)
+    if _run_command(["docker", "exec", dind_name, "docker", "image", "inspect", image]).returncode == 0:
+        return
+    if _run_command(["docker", "exec", dind_name, "docker", "pull", image]).returncode == 0:
+        if _run_command(["docker", "exec", dind_name, "docker", "image", "inspect", image]).returncode == 0:
+            return
+
+    _ensure_docker_image_available(image, role=role)
+    save_proc = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+    try:
+        load_proc = subprocess.run(
+            ["docker", "exec", "-i", dind_name, "docker", "load"],
+            stdin=save_proc.stdout,
+            capture_output=True,
+            check=False,
+        )
+    finally:
+        if save_proc.stdout is not None:
+            save_proc.stdout.close()
+        save_proc.wait()
+
+    if load_proc.returncode != 0 or save_proc.returncode != 0:
+        load_message = b"".join(part for part in (load_proc.stderr, load_proc.stdout) if part)
+        raise RuntimeError(
+            f"Failed to load {role} image {image!r} into the isolated Docker daemon: "
+            f"{load_message.decode('utf-8', errors='replace').strip()}"
+        )
 
 
 def _materialize_host_repo_from_benchmark_image(context: RuntimeExecutionContext) -> None:
@@ -872,6 +1092,7 @@ def _gateway_process_env(context: RuntimeExecutionContext) -> dict[str, str]:
         "OPENCLAW_STATE_DIR": OPENCLAW_CONTAINER_STATE_DIR,
         "OPENCLAW_GATEWAY_TOKEN": _resolve_gateway_token(context),
         "OPENCLAW_DISABLE_BONJOUR": "1",
+        "DOCKER_HOST": _isolated_docker_host(context),
     }
     model = str(context.llm_config.get("model", "")).strip()
     base_url = str(context.llm_config.get("base_url", "")).strip()
@@ -1887,7 +2108,6 @@ def _cli_base_args(context: RuntimeExecutionContext, *, gateway_name: str) -> li
     ]
     args.extend(_openclaw_container_hardening_args())
     args.extend(_plugin_mount_args(context))
-    args.extend(_docker_socket_mount_args(user_spec=openclaw_user))
     docker_binary = _host_docker_binary()
     if docker_binary:
         args.extend(["-v", f"{docker_binary}:/usr/local/bin/docker:ro"])
@@ -1916,12 +2136,18 @@ def _start_gateway_container(
     gateway_name = _resolve_gateway_name(context)
     if _docker_container_running(gateway_name):
         if not restart_existing:
+            _ensure_isolated_daemon(context)
+            _docker_connect_container_to_network(
+                container_name=gateway_name,
+                network_name=_resolve_isolated_control_network_name(context),
+            )
             return gateway_name, False
         _docker_remove_container(gateway_name)
     else:
         _docker_remove_container(gateway_name)
 
     _ensure_docker_image_available(_resolve_gateway_image(context), role="OpenClaw gateway")
+    _ensure_isolated_daemon(context)
     state_dir = _state_dir(context)
     problems_root = _gateway_workspace_root(context)
     network_name, network_created = _ensure_private_network(context)
@@ -1945,7 +2171,6 @@ def _start_gateway_container(
         f"{problems_root}:{OPENCLAW_CONTAINER_PROBLEMS_ROOT}",
     ]
     args.extend(_openclaw_container_hardening_args())
-    args.extend(_docker_socket_mount_args(user_spec=openclaw_user))
     if str(problems_root) != OPENCLAW_CONTAINER_PROBLEMS_ROOT:
         args.extend(["-v", f"{problems_root}:{problems_root}"])
     args.extend(_plugin_mount_args(context))
@@ -1968,12 +2193,26 @@ def _start_gateway_container(
     )
     result = _run_command(args)
     if result.returncode != 0:
+        _teardown_isolated_daemon(context)
+        _teardown_isolated_control_network(context)
         if network_created:
             _docker_remove_network(network_name)
         raise RuntimeError(
             "Failed to start the shared OpenClaw gateway container: "
             f"{(result.stderr or result.stdout or '').strip()}"
         )
+    try:
+        _docker_connect_container_to_network(
+            container_name=gateway_name,
+            network_name=_resolve_isolated_control_network_name(context),
+        )
+    except Exception:
+        _docker_remove_container(gateway_name)
+        _teardown_isolated_daemon(context)
+        _teardown_isolated_control_network(context)
+        if network_created:
+            _docker_remove_network(network_name)
+        raise
     return gateway_name, True
 
 
@@ -2126,6 +2365,11 @@ def _run_openclaw_agent_request(
     try:
         agent_id = _build_agent_id(context)
         session_id = _build_session_id(context)
+        _ensure_image_in_isolated_daemon(
+            context,
+            _resolve_benchmark_image(context),
+            role="Benchmark sandbox",
+        )
 
         run_dir = context.instance_dir / "openclaw"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -2364,7 +2608,11 @@ def _run_openclaw_agent_request(
         )
         if agent_id and not keep_gateway:
             for tracked_session_id in sorted(set(attempted_session_ids)):
-                _cleanup_sandbox_containers(agent_id=agent_id, session_id=tracked_session_id)
+                _cleanup_sandbox_containers(
+                    context,
+                    agent_id=agent_id,
+                    session_id=tracked_session_id,
+                )
         if not keep_workspace:
             problem_root = _problem_root(context)
             if problem_root.exists():
@@ -2399,11 +2647,13 @@ def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionR
     finally:
         if gateway_started and not keep_gateway:
             _docker_remove_container(gateway_name)
+            _teardown_isolated_daemon(context)
+            _teardown_isolated_control_network(context)
+            _teardown_private_network(context)
         if not keep_workspace:
             workspace_root = _gateway_workspace_root(context)
             if workspace_root.exists():
                 shutil.rmtree(workspace_root, ignore_errors=True)
-            _teardown_private_network(context)
 
 
 def run_openclaw_batch(
@@ -2498,11 +2748,13 @@ def run_openclaw_batch(
     finally:
         if gateway_started and not keep_gateway:
             _docker_remove_container(gateway_name)
+            _teardown_isolated_daemon(primary)
+            _teardown_isolated_control_network(primary)
+            _teardown_private_network(primary)
         if not keep_workspace:
             workspace_root = _gateway_workspace_root(primary)
             if workspace_root.exists():
                 shutil.rmtree(workspace_root, ignore_errors=True)
-            _teardown_private_network(primary)
 
 
 OPENCLAW_BACKEND = RuntimeBackend(

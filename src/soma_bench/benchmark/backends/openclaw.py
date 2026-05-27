@@ -335,6 +335,14 @@ def _resolve_keep_gateway_enabled(context: RuntimeExecutionContext) -> bool:
     return _coerce_bool_option(env_value) or False
 
 
+def _resolve_keep_workspace_enabled(context: RuntimeExecutionContext) -> bool:
+    raw_value = _resolve_runtime_option(context, "openclaw_keep_workspace")
+    option_value = _coerce_bool_option(raw_value)
+    if option_value is not None:
+        return option_value
+
+    env_value = os.getenv("SOMA_OPENCLAW_KEEP_WORKSPACE")
+    return _coerce_bool_option(env_value) or False
 def _resolve_requested_openclaw_user(context: RuntimeExecutionContext) -> str | None:
     for value in (
         _resolve_runtime_option(context, "openclaw_user"),
@@ -2106,6 +2114,7 @@ def _run_openclaw_agent_request(
     *,
     gateway_name: str,
     keep_gateway: bool,
+    keep_workspace: bool,
     gateway_started: bool,
     plugin_runtime: dict[str, Any],
 ) -> RuntimeExecutionResult:
@@ -2356,6 +2365,14 @@ def _run_openclaw_agent_request(
         if agent_id and not keep_gateway:
             for tracked_session_id in sorted(set(attempted_session_ids)):
                 _cleanup_sandbox_containers(agent_id=agent_id, session_id=tracked_session_id)
+        if not keep_workspace:
+            problem_root = _problem_root(context)
+            if problem_root.exists():
+                emit_progress(
+                    f"[{context.instance.instance_id}] removing problem workspace at {problem_root}",
+                    component="openclaw",
+                )
+                shutil.rmtree(problem_root, ignore_errors=True)
 
 
 def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionResult:
@@ -2363,6 +2380,7 @@ def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionR
         raise RuntimeError(OPENCLAW_WORKSPACE_ERROR.format(workspace=context.workspace))
 
     keep_gateway = _resolve_keep_gateway_enabled(context)
+    keep_workspace = _resolve_keep_workspace_enabled(context)
     _prepare_openclaw_context(context)
     _ensure_agent_config(context)
     plugin_runtime = _ensure_plugin_runtime(context)
@@ -2374,12 +2392,17 @@ def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionR
             context,
             gateway_name=gateway_name,
             keep_gateway=keep_gateway,
+            keep_workspace=keep_workspace,
             gateway_started=gateway_started,
             plugin_runtime=plugin_runtime,
         )
     finally:
         if gateway_started and not keep_gateway:
             _docker_remove_container(gateway_name)
+        if not keep_workspace:
+            workspace_root = _gateway_workspace_root(context)
+            if workspace_root.exists():
+                shutil.rmtree(workspace_root, ignore_errors=True)
             _teardown_private_network(context)
 
 
@@ -2390,6 +2413,7 @@ def run_openclaw_batch(
     _validate_batch_contexts(contexts)
     primary = contexts[0]
     keep_gateway = _resolve_keep_gateway_enabled(primary)
+    keep_workspace = _resolve_keep_workspace_enabled(primary)
     gateway_name = _resolve_gateway_name(primary)
     gateway_started = False
     results: list[RuntimeExecutionResult | None] = [None] * len(contexts)
@@ -2443,6 +2467,7 @@ def run_openclaw_batch(
                         context,
                         gateway_name=gateway_name,
                         keep_gateway=keep_gateway,
+                        keep_workspace=keep_workspace,
                         gateway_started=gateway_started,
                         plugin_runtime=plugin_runtime,
                     )
@@ -2457,6 +2482,7 @@ def run_openclaw_batch(
                     context,
                     gateway_name=gateway_name,
                     keep_gateway=keep_gateway,
+                    keep_workspace=keep_workspace,
                     gateway_started=gateway_started,
                     plugin_runtime=plugin_runtime,
                 ): index
@@ -2472,6 +2498,10 @@ def run_openclaw_batch(
     finally:
         if gateway_started and not keep_gateway:
             _docker_remove_container(gateway_name)
+        if not keep_workspace:
+            workspace_root = _gateway_workspace_root(primary)
+            if workspace_root.exists():
+                shutil.rmtree(workspace_root, ignore_errors=True)
             _teardown_private_network(primary)
 
 

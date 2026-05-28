@@ -973,13 +973,19 @@ def _copy_miner_to_dind(*, dind_name: str, miner_script: Path) -> None:
             f"Failed to create miner directory in DinD at {dind_dir}: "
             f"{(mkdir_result.stderr or mkdir_result.stdout or '').strip()}"
         )
-    cp_result = _run_command(
-        ["docker", "cp", str(miner_script), f"{dind_name}:{COMPRESSION_SERVICE_DIND_MINER_PATH}"]
+    # docker cp does not work reliably with DinD (overlayfs within overlayfs);
+    # pipe the file content through stdin instead.
+    miner_content = miner_script.read_bytes()
+    pipe_result = subprocess.run(
+        ["docker", "exec", "-i", dind_name, "sh", "-c", f"cat > {COMPRESSION_SERVICE_DIND_MINER_PATH}"],
+        input=miner_content,
+        capture_output=True,
+        check=False,
     )
-    if cp_result.returncode != 0:
+    if pipe_result.returncode != 0:
         raise RuntimeError(
             f"Failed to copy miner script into DinD: "
-            f"{(cp_result.stderr or cp_result.stdout or '').strip()}"
+            f"{(pipe_result.stderr or pipe_result.stdout or b'').decode('utf-8', errors='replace').strip()}"
         )
 
 

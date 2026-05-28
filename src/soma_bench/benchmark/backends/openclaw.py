@@ -31,6 +31,10 @@ OPENCLAW_GATEWAY_IMAGE = "alpine/openclaw:latest"
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_GATEWAY_START_RETRIES = 20
 OPENCLAW_GATEWAY_START_SLEEP_SECONDS = 0.5
+OPENCLAW_DIND_IMAGE = "docker:dind"
+OPENCLAW_DIND_PORT = 2375
+OPENCLAW_DIND_START_RETRIES = 60
+OPENCLAW_DIND_START_SLEEP_SECONDS = 0.5
 OPENCLAW_GATEWAY_STATE_DIRNAME = "openclaw-gateway-state"
 OPENCLAW_PROBLEMS_DIRNAME = "openclaw-problems"
 OPENCLAW_CONTAINER_ARTIFACTS_PATH = "/artifacts"
@@ -51,9 +55,17 @@ OPENCLAW_WS_WATCHDOG_MAX_BACKOFF_SECONDS = 10.0
 OPENCLAW_HEARTBEAT_DISABLED_INTERVAL = "0m"
 OPENCLAW_GATEWAY_PIDS_LIMIT = 4096
 OPENCLAW_GATEWAY_ULIMIT_NOFILE = "4096"
+COMPRESSION_SERVICE_IMAGE_NAME = "soma-compression-service:latest"
+COMPRESSION_SERVICE_PORT = 8000
+COMPRESSION_SERVICE_DIND_MINER_PATH = "/tmp/soma-miner/base_miner.py"
+COMPRESSION_SERVICE_CONTAINER_MINER_PATH = "/app/miner/base_miner.py"
+COMPRESSION_SERVICE_START_RETRIES = 60
+COMPRESSION_SERVICE_START_SLEEP_SECONDS = 0.5
 _PLUGIN_REINSTALLED_FOR_RUNS: set[str] = set()
 _GATEWAY_RECOVERY_LOCK = threading.Lock()
 _GATEWAY_RECOVERY_LOCKS: dict[str, threading.Lock] = {}
+_COMPRESSION_SERVICE_STATE: dict[str, str] = {}  # gateway_name -> service URL
+_COMPRESSION_SERVICE_STATE_LOCK = threading.Lock()
 _WS_CLOSE_RE = re.compile(
     r"gateway closed \((?P<code>\d{3,4})\s+(?P<reason>[^)]*)\)",
     re.IGNORECASE,
@@ -335,6 +347,14 @@ def _resolve_keep_gateway_enabled(context: RuntimeExecutionContext) -> bool:
     return _coerce_bool_option(env_value) or False
 
 
+def _resolve_keep_workspace_enabled(context: RuntimeExecutionContext) -> bool:
+    raw_value = _resolve_runtime_option(context, "openclaw_keep_workspace")
+    option_value = _coerce_bool_option(raw_value)
+    if option_value is not None:
+        return option_value
+
+    env_value = os.getenv("SOMA_OPENCLAW_KEEP_WORKSPACE")
+    return _coerce_bool_option(env_value) or False
 def _resolve_requested_openclaw_user(context: RuntimeExecutionContext) -> str | None:
     for value in (
         _resolve_runtime_option(context, "openclaw_user"),
@@ -662,6 +682,16 @@ def _resolve_gateway_port(context: RuntimeExecutionContext) -> int:
     return OPENCLAW_GATEWAY_PORT
 
 
+def _resolve_dind_image(context: RuntimeExecutionContext) -> str:
+    for value in (
+        _resolve_runtime_option(context, "openclaw_dind_image"),
+        os.getenv("SOMA_OPENCLAW_DIND_IMAGE"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return OPENCLAW_DIND_IMAGE
+
+
 def _resolve_requested_private_network_name(context: RuntimeExecutionContext) -> str | None:
     for value in (
         _resolve_runtime_option(context, "openclaw_private_network_name"),
@@ -678,6 +708,18 @@ def _resolve_private_network_name(context: RuntimeExecutionContext) -> str:
         return requested_name
     digest = hashlib.sha256(str(context.output_dir.resolve()).encode("utf-8")).hexdigest()[:12]
     return f"soma-openclaw-net-{digest}"
+
+
+def _resolve_isolated_control_network_name(context: RuntimeExecutionContext) -> str:
+    return f"{_resolve_gateway_name(context)}-control"
+
+
+def _dind_container_name(context: RuntimeExecutionContext) -> str:
+    return f"{_resolve_gateway_name(context)}-dind"
+
+
+def _isolated_docker_host(context: RuntimeExecutionContext) -> str:
+    return f"tcp://{_dind_container_name(context)}:{OPENCLAW_DIND_PORT}"
 
 
 def _openclaw_container_hardening_args() -> list[str]:
@@ -782,12 +824,308 @@ def _docker_list_container_ids_by_label(label: str) -> list[str]:
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
 
+def _docker_network_contains_container(network_name: str, container_name: str) -> bool:
+    inspect_result = _run_command(["docker", "network", "inspect", network_name])
+    if inspect_result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(inspect_result.stdout or "[]")
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+        return False
+    containers = payload[0].get("Containers")
+    if not isinstance(containers, dict):
+        return False
+    return any(
+        isinstance(entry, dict) and entry.get("Name") == container_name
+        for entry in containers.values()
+    )
+
+
+def _docker_connect_container_to_network(*, container_name: str, network_name: str) -> None:
+    if _docker_network_contains_container(network_name, container_name):
+        return
+    result = _run_command(["docker", "network", "connect", network_name, container_name])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to connect container {container_name!r} to Docker network {network_name!r}: "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+
+
+def _run_isolated_docker_command(
+    context: RuntimeExecutionContext,
+    args: list[str],
+) -> subprocess.CompletedProcess[str]:
+    return _run_command(["docker", "exec", _dind_container_name(context), "docker", *args])
+
+
+def _isolated_docker_list_container_ids_by_label(
+    context: RuntimeExecutionContext,
+    label: str,
+) -> list[str]:
+    result = _run_isolated_docker_command(context, ["ps", "-aq", "--filter", f"label={label}"])
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def _isolated_docker_remove_container(context: RuntimeExecutionContext, name: str) -> None:
+    _run_isolated_docker_command(context, ["rm", "-f", name])
+
+
+# ---------------------------------------------------------------------------
+# Compression service helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_compression_service_enabled(context: RuntimeExecutionContext) -> bool:
+    for value in (
+        _resolve_runtime_option(context, "openclaw_compression_service"),
+        os.getenv("SOMA_OPENCLAW_COMPRESSION_SERVICE"),
+    ):
+        option = _coerce_bool_option(value)
+        if option is not None:
+            return option
+    return True  # enabled by default when plugin_path is set and miner script exists
+
+
+def _resolve_compression_service_image() -> str:
+    return (
+        os.getenv("COMPACT_BENCH_COMPRESSION_SERVICE_IMAGE", "").strip()
+        or COMPRESSION_SERVICE_IMAGE_NAME
+    )
+
+
+def _resolve_compression_service_context_dir() -> Path | None:
+    configured = os.getenv("COMPACT_BENCH_COMPRESSION_SERVICE_CONTEXT", "").strip()
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        return path if path.is_dir() else None
+    # Relative to well-known repo locations
+    candidates = [
+        Path(__file__).resolve().parents[4] / "SOMA-miner-fastapi" / "sandbox_service" / "compression_service",
+        Path(__file__).resolve().parents[5] / "SOMA-miner-fastapi" / "sandbox_service" / "compression_service",
+        Path.home() / "SOMA-miner-fastapi" / "sandbox_service" / "compression_service",
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+    return None
+
+
+def _compression_service_container_name(context: RuntimeExecutionContext) -> str:
+    gateway_name = _resolve_gateway_name(context)
+    digest = hashlib.sha256(gateway_name.encode("utf-8")).hexdigest()[:12]
+    return f"soma-compress-{digest}"
+
+
+def _build_compression_service_image_on_host() -> None:
+    image_name = _resolve_compression_service_image()
+    if _docker_image_exists(image_name):
+        return
+    context_dir = _resolve_compression_service_context_dir()
+    if context_dir is None:
+        raise RuntimeError(
+            "Compression service build context not found. "
+            "Set COMPACT_BENCH_COMPRESSION_SERVICE_CONTEXT or ensure SOMA-miner-fastapi is reachable."
+        )
+    result = _run_command(["docker", "build", "-t", image_name, str(context_dir)])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to build compression service image {image_name!r}: "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+
+
+def _ensure_compression_service_image_in_dind(context: RuntimeExecutionContext) -> None:
+    image_name = _resolve_compression_service_image()
+    dind_name = _dind_container_name(context)
+    if _run_command(["docker", "exec", dind_name, "docker", "image", "inspect", image_name]).returncode == 0:
+        return
+    _build_compression_service_image_on_host()
+    save_proc = subprocess.Popen(["docker", "save", image_name], stdout=subprocess.PIPE)
+    try:
+        load_result = subprocess.run(
+            ["docker", "exec", "-i", dind_name, "docker", "load"],
+            stdin=save_proc.stdout,
+            capture_output=True,
+            check=False,
+        )
+    finally:
+        if save_proc.stdout is not None:
+            save_proc.stdout.close()
+        save_proc.wait()
+    if load_result.returncode != 0 or save_proc.returncode != 0:
+        msg = b"".join(p for p in (load_result.stderr, load_result.stdout) if p)
+        raise RuntimeError(
+            f"Failed to load compression service image into DinD: "
+            f"{msg.decode('utf-8', errors='replace').strip()}"
+        )
+
+
+def _copy_miner_to_dind(*, dind_name: str, miner_script: Path) -> None:
+    dind_dir = str(Path(COMPRESSION_SERVICE_DIND_MINER_PATH).parent)
+    mkdir_result = _run_command(["docker", "exec", dind_name, "mkdir", "-p", dind_dir])
+    if mkdir_result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to create miner directory in DinD at {dind_dir}: "
+            f"{(mkdir_result.stderr or mkdir_result.stdout or '').strip()}"
+        )
+    cp_result = _run_command(
+        ["docker", "cp", str(miner_script), f"{dind_name}:{COMPRESSION_SERVICE_DIND_MINER_PATH}"]
+    )
+    if cp_result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to copy miner script into DinD: "
+            f"{(cp_result.stderr or cp_result.stdout or '').strip()}"
+        )
+
+
+def _start_compression_service_in_dind(context: RuntimeExecutionContext) -> None:
+    container_name = _compression_service_container_name(context)
+    image_name = _resolve_compression_service_image()
+    # Remove any stale container first
+    _run_isolated_docker_command(context, ["rm", "-f", container_name])
+    run_args = [
+        "run", "-d", "--rm",
+        "--name", container_name,
+        "-p", f"{COMPRESSION_SERVICE_PORT}:{COMPRESSION_SERVICE_PORT}",
+        "-v", f"{COMPRESSION_SERVICE_DIND_MINER_PATH}:{COMPRESSION_SERVICE_CONTAINER_MINER_PATH}:ro",
+        "-e", f"MINER_MODULE_PATH={COMPRESSION_SERVICE_CONTAINER_MINER_PATH}",
+        image_name,
+    ]
+    result = _run_isolated_docker_command(context, run_args)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to start compression service in DinD: "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+
+
+def _wait_for_compression_service_ready(context: RuntimeExecutionContext) -> None:
+    dind_name = _dind_container_name(context)
+    container_name = _compression_service_container_name(context)
+    last_error = ""
+    for _ in range(COMPRESSION_SERVICE_START_RETRIES):
+        # Check container is still running
+        running = _run_isolated_docker_command(
+            context, ["inspect", "-f", "{{.State.Running}}", container_name]
+        )
+        if (running.stdout or "").strip().lower() == "false":
+            raise RuntimeError(
+                f"Compression service container {container_name!r} exited before becoming ready"
+            )
+        # Probe health endpoint from within DinD (wget is available in docker:dind Alpine image)
+        probe = _run_command([
+            "docker", "exec", dind_name,
+            "wget", "-qO-", "--timeout=2",
+            f"http://127.0.0.1:{COMPRESSION_SERVICE_PORT}/health",
+        ])
+        if probe.returncode == 0:
+            return
+        last_error = (probe.stderr or probe.stdout or "").strip()
+        time.sleep(COMPRESSION_SERVICE_START_SLEEP_SECONDS)
+    raise RuntimeError(
+        f"Compression service did not become ready after {COMPRESSION_SERVICE_START_RETRIES} retries: "
+        f"{last_error}"
+    )
+
+
+def _ensure_compression_service(context: RuntimeExecutionContext) -> str | None:
+    """Start the compression service inside DinD and return its URL accessible by the gateway.
+
+    The gateway container (attached to the control network alongside DinD) can reach the
+    service at ``http://<dind_name>:<port>`` because Docker-in-Docker port mappings are
+    handled by docker-proxy bound to DinD's own network interfaces.
+
+    Returns the service URL, or ``None`` if compression service is disabled or the miner
+    script is not available.
+    """
+    if not _resolve_compression_service_enabled(context):
+        return None
+
+    plugin_path = _resolve_plugin_path(context)
+    if plugin_path is None:
+        return None
+
+    miner_script = plugin_path / PLUGIN_ENTRYPOINT
+    if not miner_script.is_file():
+        return None
+
+    gateway_name = _resolve_gateway_name(context)
+    with _COMPRESSION_SERVICE_STATE_LOCK:
+        existing_url = _COMPRESSION_SERVICE_STATE.get(gateway_name)
+    if existing_url is not None:
+        return existing_url
+
+    emit_progress(
+        f"building and loading compression service image into DinD",
+        component="openclaw",
+    )
+    _ensure_compression_service_image_in_dind(context)
+
+    emit_progress(
+        f"copying miner code into DinD at {COMPRESSION_SERVICE_DIND_MINER_PATH}",
+        component="openclaw",
+    )
+    _copy_miner_to_dind(dind_name=_dind_container_name(context), miner_script=miner_script)
+
+    emit_progress(
+        f"starting compression service container inside DinD",
+        component="openclaw",
+    )
+    _start_compression_service_in_dind(context)
+    _wait_for_compression_service_ready(context)
+
+    service_url = f"http://{_dind_container_name(context)}:{COMPRESSION_SERVICE_PORT}"
+
+    with _COMPRESSION_SERVICE_STATE_LOCK:
+        _COMPRESSION_SERVICE_STATE[gateway_name] = service_url
+
+    emit_progress(
+        f"compression service ready at {service_url}",
+        component="openclaw",
+    )
+    return service_url
+
+
+def _teardown_compression_service(context: RuntimeExecutionContext) -> None:
+    gateway_name = _resolve_gateway_name(context)
+    with _COMPRESSION_SERVICE_STATE_LOCK:
+        if gateway_name not in _COMPRESSION_SERVICE_STATE:
+            return
+        del _COMPRESSION_SERVICE_STATE[gateway_name]
+    try:
+        _isolated_docker_remove_container(context, _compression_service_container_name(context))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+
+
 def _build_sandbox_session_key(*, agent_id: str, session_id: str) -> str:
     return f"agent:{agent_id}:explicit:{session_id}"
 
 
-def _cleanup_sandbox_containers(*, agent_id: str, session_id: str) -> None:
+def _cleanup_sandbox_containers(
+    context: RuntimeExecutionContext,
+    *,
+    agent_id: str,
+    session_id: str,
+) -> None:
     session_key = _build_sandbox_session_key(agent_id=agent_id, session_id=session_id)
+    if _docker_container_running(_dind_container_name(context)):
+        container_ids = _isolated_docker_list_container_ids_by_label(
+            context,
+            f"openclaw.sessionKey={session_key}",
+        )
+        for container_id in container_ids:
+            _isolated_docker_remove_container(context, container_id)
+        return
+
     for container_id in _docker_list_container_ids_by_label(f"openclaw.sessionKey={session_key}"):
         _docker_remove_container(container_id)
 
@@ -813,10 +1151,139 @@ def _ensure_private_network(context: RuntimeExecutionContext) -> tuple[str, bool
     return name, True
 
 
+def _ensure_isolated_control_network(context: RuntimeExecutionContext) -> tuple[str, bool]:
+    name = _resolve_isolated_control_network_name(context)
+    if _run_command(["docker", "network", "inspect", name]).returncode == 0:
+        return name, False
+    create = _run_command(["docker", "network", "create", "--internal", name])
+    if create.returncode != 0 and _run_command(["docker", "network", "inspect", name]).returncode != 0:
+        raise RuntimeError(
+            "Failed to create the isolated OpenClaw control network "
+            f"{name!r}: {(create.stderr or create.stdout or '').strip()}"
+        )
+    return name, True
+
+
+def _ensure_isolated_sandbox_network(context: RuntimeExecutionContext) -> None:
+    name = _resolve_private_network_name(context)
+    if name in {"", "none", "bridge", "host"}:
+        return
+
+    inspect = _run_isolated_docker_command(context, ["network", "inspect", name])
+    if inspect.returncode == 0:
+        return
+
+    create = _run_isolated_docker_command(context, ["network", "create", "--internal", name])
+    if create.returncode != 0 and _run_isolated_docker_command(context, ["network", "inspect", name]).returncode != 0:
+        raise RuntimeError(
+            "Failed to create the isolated OpenClaw sandbox network "
+            f"{name!r}: {(create.stderr or create.stdout or '').strip()}"
+        )
+
+
 def _teardown_private_network(context: RuntimeExecutionContext) -> None:
     if _resolve_requested_private_network_name(context) is not None:
         return
     _docker_remove_network(_resolve_private_network_name(context))
+
+
+def _teardown_isolated_control_network(context: RuntimeExecutionContext) -> None:
+    _docker_remove_network(_resolve_isolated_control_network_name(context))
+
+
+def _wait_for_isolated_daemon_ready(*, dind_name: str) -> None:
+    last_error = ""
+    for _ in range(OPENCLAW_DIND_START_RETRIES):
+        if not _docker_container_running(dind_name):
+            logs = _run_command(["docker", "logs", dind_name])
+            raise RuntimeError(
+                "OpenClaw isolated Docker daemon exited before becoming ready: "
+                f"{(logs.stderr or logs.stdout or '').strip()}"
+            )
+        probe = _run_command(["docker", "exec", dind_name, "docker", "info"])
+        if probe.returncode == 0:
+            return
+        last_error = (probe.stderr or probe.stdout or "").strip()
+        time.sleep(OPENCLAW_DIND_START_SLEEP_SECONDS)
+    raise RuntimeError(f"OpenClaw isolated Docker daemon did not become ready: {last_error}")
+
+
+def _ensure_isolated_daemon(context: RuntimeExecutionContext) -> str:
+    network_name, network_created = _ensure_isolated_control_network(context)
+
+    dind_name = _dind_container_name(context)
+    if _docker_container_running(dind_name):
+        _ensure_isolated_sandbox_network(context)
+        return _isolated_docker_host(context)
+
+    _docker_remove_container(dind_name)
+    _ensure_docker_image_available(_resolve_dind_image(context), role="OpenClaw isolated Docker daemon")
+    args = [
+        "docker",
+        "run",
+        "-d",
+        "--rm",
+        "--privileged",
+        "--name",
+        dind_name,
+        "--network",
+        network_name,
+        "-e",
+        "DOCKER_TLS_CERTDIR=",
+        _resolve_dind_image(context),
+    ]
+    result = _run_command(args)
+    if result.returncode != 0:
+        if network_created:
+            _docker_remove_network(network_name)
+        raise RuntimeError(
+            "Failed to start the OpenClaw isolated Docker daemon: "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+
+    _wait_for_isolated_daemon_ready(dind_name=dind_name)
+    _ensure_isolated_sandbox_network(context)
+    return _isolated_docker_host(context)
+
+
+def _teardown_isolated_daemon(context: RuntimeExecutionContext) -> None:
+    _docker_remove_container(_dind_container_name(context))
+
+
+def _ensure_image_in_isolated_daemon(
+    context: RuntimeExecutionContext,
+    image: str,
+    *,
+    role: str,
+) -> None:
+    _ensure_isolated_daemon(context)
+    dind_name = _dind_container_name(context)
+    if _run_command(["docker", "exec", dind_name, "docker", "image", "inspect", image]).returncode == 0:
+        return
+    if _run_command(["docker", "exec", dind_name, "docker", "pull", image]).returncode == 0:
+        if _run_command(["docker", "exec", dind_name, "docker", "image", "inspect", image]).returncode == 0:
+            return
+
+    _ensure_docker_image_available(image, role=role)
+    save_proc = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+    try:
+        load_proc = subprocess.run(
+            ["docker", "exec", "-i", dind_name, "docker", "load"],
+            stdin=save_proc.stdout,
+            capture_output=True,
+            check=False,
+        )
+    finally:
+        if save_proc.stdout is not None:
+            save_proc.stdout.close()
+        save_proc.wait()
+
+    if load_proc.returncode != 0 or save_proc.returncode != 0:
+        load_message = b"".join(part for part in (load_proc.stderr, load_proc.stdout) if part)
+        raise RuntimeError(
+            f"Failed to load {role} image {image!r} into the isolated Docker daemon: "
+            f"{load_message.decode('utf-8', errors='replace').strip()}"
+        )
 
 
 def _materialize_host_repo_from_benchmark_image(context: RuntimeExecutionContext) -> None:
@@ -864,6 +1331,7 @@ def _gateway_process_env(context: RuntimeExecutionContext) -> dict[str, str]:
         "OPENCLAW_STATE_DIR": OPENCLAW_CONTAINER_STATE_DIR,
         "OPENCLAW_GATEWAY_TOKEN": _resolve_gateway_token(context),
         "OPENCLAW_DISABLE_BONJOUR": "1",
+        "DOCKER_HOST": _isolated_docker_host(context),
     }
     model = str(context.llm_config.get("model", "")).strip()
     base_url = str(context.llm_config.get("base_url", "")).strip()
@@ -875,6 +1343,11 @@ def _gateway_process_env(context: RuntimeExecutionContext) -> dict[str, str]:
         env["OPENAI_API_KEY"] = api_key
     if base_url and not is_openrouter:
         env["OPENAI_BASE_URL"] = base_url
+    gateway_name = _resolve_gateway_name(context)
+    with _COMPRESSION_SERVICE_STATE_LOCK:
+        service_url = _COMPRESSION_SERVICE_STATE.get(gateway_name)
+    if service_url:
+        env["SOMA_COMPRESSION_SERVICE_URL"] = service_url
     return env
 
 
@@ -1645,6 +2118,8 @@ def _build_provider_config(context: RuntimeExecutionContext) -> dict[str, Any]:
             "baseUrl": base_url or "https://api.openai.com/v1",
             "models": [{"id": model_id, "name": model_id}] if model_id else [],
         }
+        if use_openai_proxy_without_api_key:
+            openai_provider["request"] = {"allowPrivateNetwork": True}
         if api_key:
             openai_provider["apiKey"] = "${OPENAI_API_KEY}"
         elif use_openai_proxy_without_api_key:
@@ -1755,7 +2230,7 @@ def _configure_agent_config_common(context: RuntimeExecutionContext, config: dic
         env_vars = {}
         env["vars"] = env_vars
     gateway_env = _gateway_process_env(context)
-    for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"):
+    for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "SOMA_COMPRESSION_SERVICE_URL"):
         if key in gateway_env:
             env_vars[key] = gateway_env[key]
 
@@ -1879,7 +2354,6 @@ def _cli_base_args(context: RuntimeExecutionContext, *, gateway_name: str) -> li
     ]
     args.extend(_openclaw_container_hardening_args())
     args.extend(_plugin_mount_args(context))
-    args.extend(_docker_socket_mount_args(user_spec=openclaw_user))
     docker_binary = _host_docker_binary()
     if docker_binary:
         args.extend(["-v", f"{docker_binary}:/usr/local/bin/docker:ro"])
@@ -1908,12 +2382,18 @@ def _start_gateway_container(
     gateway_name = _resolve_gateway_name(context)
     if _docker_container_running(gateway_name):
         if not restart_existing:
+            _ensure_isolated_daemon(context)
+            _docker_connect_container_to_network(
+                container_name=gateway_name,
+                network_name=_resolve_isolated_control_network_name(context),
+            )
             return gateway_name, False
         _docker_remove_container(gateway_name)
     else:
         _docker_remove_container(gateway_name)
 
     _ensure_docker_image_available(_resolve_gateway_image(context), role="OpenClaw gateway")
+    _ensure_isolated_daemon(context)
     state_dir = _state_dir(context)
     problems_root = _gateway_workspace_root(context)
     network_name, network_created = _ensure_private_network(context)
@@ -1937,7 +2417,6 @@ def _start_gateway_container(
         f"{problems_root}:{OPENCLAW_CONTAINER_PROBLEMS_ROOT}",
     ]
     args.extend(_openclaw_container_hardening_args())
-    args.extend(_docker_socket_mount_args(user_spec=openclaw_user))
     if str(problems_root) != OPENCLAW_CONTAINER_PROBLEMS_ROOT:
         args.extend(["-v", f"{problems_root}:{problems_root}"])
     args.extend(_plugin_mount_args(context))
@@ -1960,12 +2439,26 @@ def _start_gateway_container(
     )
     result = _run_command(args)
     if result.returncode != 0:
+        _teardown_isolated_daemon(context)
+        _teardown_isolated_control_network(context)
         if network_created:
             _docker_remove_network(network_name)
         raise RuntimeError(
             "Failed to start the shared OpenClaw gateway container: "
             f"{(result.stderr or result.stdout or '').strip()}"
         )
+    try:
+        _docker_connect_container_to_network(
+            container_name=gateway_name,
+            network_name=_resolve_isolated_control_network_name(context),
+        )
+    except Exception:
+        _docker_remove_container(gateway_name)
+        _teardown_isolated_daemon(context)
+        _teardown_isolated_control_network(context)
+        if network_created:
+            _docker_remove_network(network_name)
+        raise
     return gateway_name, True
 
 
@@ -2106,6 +2599,7 @@ def _run_openclaw_agent_request(
     *,
     gateway_name: str,
     keep_gateway: bool,
+    keep_workspace: bool,
     gateway_started: bool,
     plugin_runtime: dict[str, Any],
 ) -> RuntimeExecutionResult:
@@ -2117,6 +2611,11 @@ def _run_openclaw_agent_request(
     try:
         agent_id = _build_agent_id(context)
         session_id = _build_session_id(context)
+        _ensure_image_in_isolated_daemon(
+            context,
+            _resolve_benchmark_image(context),
+            role="Benchmark sandbox",
+        )
 
         run_dir = context.instance_dir / "openclaw"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -2355,7 +2854,19 @@ def _run_openclaw_agent_request(
         )
         if agent_id and not keep_gateway:
             for tracked_session_id in sorted(set(attempted_session_ids)):
-                _cleanup_sandbox_containers(agent_id=agent_id, session_id=tracked_session_id)
+                _cleanup_sandbox_containers(
+                    context,
+                    agent_id=agent_id,
+                    session_id=tracked_session_id,
+                )
+        if not keep_workspace:
+            problem_root = _problem_root(context)
+            if problem_root.exists():
+                emit_progress(
+                    f"[{context.instance.instance_id}] removing problem workspace at {problem_root}",
+                    component="openclaw",
+                )
+                shutil.rmtree(problem_root, ignore_errors=True)
 
 
 def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionResult:
@@ -2363,9 +2874,20 @@ def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionR
         raise RuntimeError(OPENCLAW_WORKSPACE_ERROR.format(workspace=context.workspace))
 
     keep_gateway = _resolve_keep_gateway_enabled(context)
+    keep_workspace = _resolve_keep_workspace_enabled(context)
     _prepare_openclaw_context(context)
-    _ensure_agent_config(context)
     plugin_runtime = _ensure_plugin_runtime(context)
+    # Start DinD first so we can launch the compression service inside it before
+    # writing the agent config (which needs to embed SOMA_COMPRESSION_SERVICE_URL).
+    _ensure_isolated_daemon(context)
+    try:
+        _ensure_compression_service(context)
+    except Exception as exc:
+        emit_progress(
+            f"[{context.instance.instance_id}] WARNING: failed to start compression service: {exc}",
+            component="openclaw",
+        )
+    _ensure_agent_config(context)
     gateway_name, gateway_started = _start_gateway_container(context)
     try:
         _wait_for_gateway_ready(context, gateway_name=gateway_name)
@@ -2374,13 +2896,21 @@ def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionR
             context,
             gateway_name=gateway_name,
             keep_gateway=keep_gateway,
+            keep_workspace=keep_workspace,
             gateway_started=gateway_started,
             plugin_runtime=plugin_runtime,
         )
     finally:
         if gateway_started and not keep_gateway:
             _docker_remove_container(gateway_name)
+            _teardown_compression_service(context)
+            _teardown_isolated_daemon(context)
+            _teardown_isolated_control_network(context)
             _teardown_private_network(context)
+        if not keep_workspace:
+            workspace_root = _gateway_workspace_root(context)
+            if workspace_root.exists():
+                shutil.rmtree(workspace_root, ignore_errors=True)
 
 
 def run_openclaw_batch(
@@ -2390,6 +2920,7 @@ def run_openclaw_batch(
     _validate_batch_contexts(contexts)
     primary = contexts[0]
     keep_gateway = _resolve_keep_gateway_enabled(primary)
+    keep_workspace = _resolve_keep_workspace_enabled(primary)
     gateway_name = _resolve_gateway_name(primary)
     gateway_started = False
     results: list[RuntimeExecutionResult | None] = [None] * len(contexts)
@@ -2410,6 +2941,16 @@ def run_openclaw_batch(
         runnable_contexts = [context for _, context in runnable]
         gateway_context = runnable_contexts[0]
         try:
+            # Start DinD first so the compression service can be started inside it
+            # before agent configs are written (configs embed SOMA_COMPRESSION_SERVICE_URL).
+            _ensure_isolated_daemon(gateway_context)
+            try:
+                _ensure_compression_service(gateway_context)
+            except Exception as exc:
+                emit_progress(
+                    f"WARNING: failed to start compression service: {exc}",
+                    component="openclaw",
+                )
             _ensure_agent_configs(runnable_contexts)
             plugin_runtime = _ensure_plugin_runtime(gateway_context)
         except Exception as exc:
@@ -2443,6 +2984,7 @@ def run_openclaw_batch(
                         context,
                         gateway_name=gateway_name,
                         keep_gateway=keep_gateway,
+                        keep_workspace=keep_workspace,
                         gateway_started=gateway_started,
                         plugin_runtime=plugin_runtime,
                     )
@@ -2457,6 +2999,7 @@ def run_openclaw_batch(
                     context,
                     gateway_name=gateway_name,
                     keep_gateway=keep_gateway,
+                    keep_workspace=keep_workspace,
                     gateway_started=gateway_started,
                     plugin_runtime=plugin_runtime,
                 ): index
@@ -2472,7 +3015,14 @@ def run_openclaw_batch(
     finally:
         if gateway_started and not keep_gateway:
             _docker_remove_container(gateway_name)
+            _teardown_compression_service(primary)
+            _teardown_isolated_daemon(primary)
+            _teardown_isolated_control_network(primary)
             _teardown_private_network(primary)
+        if not keep_workspace:
+            workspace_root = _gateway_workspace_root(primary)
+            if workspace_root.exists():
+                shutil.rmtree(workspace_root, ignore_errors=True)
 
 
 OPENCLAW_BACKEND = RuntimeBackend(

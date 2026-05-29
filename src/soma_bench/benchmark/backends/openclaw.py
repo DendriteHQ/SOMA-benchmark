@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import hashlib
 import json
 import math
@@ -15,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .base import RuntimeBackend, RuntimeExecutionContext, RuntimeExecutionResult
 from ..progress import emit_progress
@@ -61,11 +63,26 @@ COMPRESSION_SERVICE_DIND_MINER_PATH = "/tmp/soma-miner/base_miner.py"
 COMPRESSION_SERVICE_CONTAINER_MINER_PATH = "/app/miner/base_miner.py"
 COMPRESSION_SERVICE_START_RETRIES = 60
 COMPRESSION_SERVICE_START_SLEEP_SECONDS = 0.5
+OPENCLAW_LLM_PROXY_CONTAINER_NAME = "soma-benchmark-nginx"
+OPENCLAW_LLM_PROXY_IMAGE = "nginx:1.27-alpine"
+OPENCLAW_LLM_PROXY_PORT = 8080
+OPENCLAW_CONTROL_NETWORK_PREFIX = "soma-openclaw-gateway-"
+OPENCLAW_CONTROL_NETWORK_SUFFIX = "-control"
+OPENCLAW_PRIVATE_NETWORK_PREFIX = "soma-openclaw-net-"
+OPENCLAW_NETWORK_POOL_RECOVERY_ENV = "SOMA_OPENCLAW_RECOVER_NETWORK_POOL_EXHAUSTION"
+OPENCLAW_NETWORK_POOL_CIDR_ENV = "SOMA_OPENCLAW_NETWORK_POOL_CIDR"
+OPENCLAW_NETWORK_SUBNET_PREFIX_ENV = "SOMA_OPENCLAW_NETWORK_SUBNET_PREFIX"
+OPENCLAW_NETWORK_SUBNET_ATTEMPTS_ENV = "SOMA_OPENCLAW_NETWORK_SUBNET_ATTEMPTS"
+OPENCLAW_NETWORK_DEFAULT_POOL_CIDR = "100.96.0.0/11"
+OPENCLAW_NETWORK_DEFAULT_SUBNET_PREFIX = 24
+OPENCLAW_NETWORK_DEFAULT_SUBNET_ATTEMPTS = 32
 _PLUGIN_REINSTALLED_FOR_RUNS: set[str] = set()
 _GATEWAY_RECOVERY_LOCK = threading.Lock()
 _GATEWAY_RECOVERY_LOCKS: dict[str, threading.Lock] = {}
 _COMPRESSION_SERVICE_STATE: dict[str, str] = {}  # gateway_name -> service URL
 _COMPRESSION_SERVICE_STATE_LOCK = threading.Lock()
+_LLM_PROXY_SETUP_LOCK = threading.Lock()
+_NETWORK_POOL_RECOVERY_LOCK = threading.Lock()
 _WS_CLOSE_RE = re.compile(
     r"gateway closed \((?P<code>\d{3,4})\s+(?P<reason>[^)]*)\)",
     re.IGNORECASE,
@@ -707,11 +724,11 @@ def _resolve_private_network_name(context: RuntimeExecutionContext) -> str:
     if requested_name is not None:
         return requested_name
     digest = hashlib.sha256(str(context.output_dir.resolve()).encode("utf-8")).hexdigest()[:12]
-    return f"soma-openclaw-net-{digest}"
+    return f"{OPENCLAW_PRIVATE_NETWORK_PREFIX}{digest}"
 
 
 def _resolve_isolated_control_network_name(context: RuntimeExecutionContext) -> str:
-    return f"{_resolve_gateway_name(context)}-control"
+    return f"{_resolve_gateway_name(context)}{OPENCLAW_CONTROL_NETWORK_SUFFIX}"
 
 
 def _dind_container_name(context: RuntimeExecutionContext) -> str:
@@ -817,6 +834,175 @@ def _docker_remove_network(name: str) -> None:
     _run_command(["docker", "network", "rm", name])
 
 
+def _docker_list_network_names() -> list[str]:
+    result = _run_command(["docker", "network", "ls", "--format", "{{.Name}}"])
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def _docker_network_container_count(network_name: str) -> int | None:
+    inspect_result = _run_command(["docker", "network", "inspect", network_name])
+    if inspect_result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(inspect_result.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+        return None
+    containers = payload[0].get("Containers")
+    if not isinstance(containers, dict):
+        return 0
+    return len(containers)
+
+
+def _is_openclaw_ephemeral_network_name(name: str) -> bool:
+    return (
+        (name.startswith(OPENCLAW_CONTROL_NETWORK_PREFIX) and name.endswith(OPENCLAW_CONTROL_NETWORK_SUFFIX))
+        or name.startswith(OPENCLAW_PRIVATE_NETWORK_PREFIX)
+    )
+
+
+def _is_docker_network_pool_exhaustion_error(message: str) -> bool:
+    normalized = message.lower()
+    return (
+        "all predefined address pools have been fully subnetted" in normalized
+        or "could not find an available, non-overlapping ipv4 address pool among the defaults" in normalized
+    )
+
+
+def _is_docker_network_subnet_conflict_error(message: str) -> bool:
+    normalized = message.lower()
+    return (
+        "pool overlaps with other one on this address space" in normalized
+        or "requested subnet overlaps with other one on this address space" in normalized
+        or "address already in use" in normalized
+    )
+
+
+def _resolve_openclaw_network_pool() -> tuple[ipaddress.IPv4Network, int, int]:
+    raw_pool = os.getenv(OPENCLAW_NETWORK_POOL_CIDR_ENV, OPENCLAW_NETWORK_DEFAULT_POOL_CIDR).strip()
+    if not raw_pool:
+        raw_pool = OPENCLAW_NETWORK_DEFAULT_POOL_CIDR
+    try:
+        pool = ipaddress.ip_network(raw_pool, strict=True)
+    except ValueError:
+        pool = ipaddress.ip_network(OPENCLAW_NETWORK_DEFAULT_POOL_CIDR, strict=True)
+
+    if not isinstance(pool, ipaddress.IPv4Network):
+        pool = ipaddress.ip_network(OPENCLAW_NETWORK_DEFAULT_POOL_CIDR, strict=True)
+
+    subnet_prefix = _coerce_positive_int(
+        os.getenv(OPENCLAW_NETWORK_SUBNET_PREFIX_ENV),
+        OPENCLAW_NETWORK_DEFAULT_SUBNET_PREFIX,
+    )
+    min_prefix = pool.prefixlen
+    max_prefix = 30
+    if subnet_prefix < min_prefix or subnet_prefix > max_prefix:
+        subnet_prefix = OPENCLAW_NETWORK_DEFAULT_SUBNET_PREFIX
+    if subnet_prefix < min_prefix:
+        subnet_prefix = min_prefix
+    if subnet_prefix > max_prefix:
+        subnet_prefix = max_prefix
+
+    attempts = _coerce_positive_int(
+        os.getenv(OPENCLAW_NETWORK_SUBNET_ATTEMPTS_ENV),
+        OPENCLAW_NETWORK_DEFAULT_SUBNET_ATTEMPTS,
+    )
+    return pool, subnet_prefix, attempts
+
+
+def _iter_openclaw_network_subnet_candidates(network_name: str) -> list[str]:
+    pool, subnet_prefix, attempts = _resolve_openclaw_network_pool()
+    subnet_count = 1 << (subnet_prefix - pool.prefixlen)
+    if subnet_count <= 0:
+        return []
+
+    max_attempts = max(1, min(attempts, subnet_count))
+    subnet_size = 1 << (32 - subnet_prefix)
+    pool_base = int(pool.network_address)
+    start = int(hashlib.sha256(network_name.encode("utf-8")).hexdigest()[:16], 16) % subnet_count
+
+    candidates: list[str] = []
+    for offset in range(max_attempts):
+        index = (start + offset) % subnet_count
+        network_base = pool_base + (index * subnet_size)
+        candidate = ipaddress.IPv4Network((network_base, subnet_prefix))
+        if candidate.subnet_of(pool):
+            candidates.append(str(candidate))
+    return candidates
+
+
+def _create_docker_network(
+    *,
+    name: str,
+    internal: bool,
+) -> subprocess.CompletedProcess[str]:
+    base_args = ["docker", "network", "create"]
+    if internal:
+        base_args.append("--internal")
+    subnet_candidates = _iter_openclaw_network_subnet_candidates(name)
+
+    for subnet in subnet_candidates:
+        result = _run_command([*base_args, "--subnet", subnet, name])
+        if result.returncode == 0 or _run_command(["docker", "network", "inspect", name]).returncode == 0:
+            return result
+        if not _is_docker_network_subnet_conflict_error((result.stderr or result.stdout or "").strip()):
+            return result
+
+    fallback = _run_command([*base_args, name])
+    if fallback.returncode == 0 or _run_command(["docker", "network", "inspect", name]).returncode == 0:
+        return fallback
+    return fallback
+
+
+def _remove_stale_openclaw_networks(*, keep_names: set[str]) -> int:
+    removed = 0
+    for candidate in _docker_list_network_names():
+        if candidate in keep_names:
+            continue
+        if not _is_openclaw_ephemeral_network_name(candidate):
+            continue
+        container_count = _docker_network_container_count(candidate)
+        if container_count != 0:
+            continue
+        remove = _run_command(["docker", "network", "rm", candidate])
+        if remove.returncode == 0:
+            removed += 1
+    return removed
+
+
+def _recover_openclaw_network_pool_if_needed(
+    context: RuntimeExecutionContext,
+    *,
+    failed_network_name: str,
+    create_error: str,
+) -> int:
+    if not _is_docker_network_pool_exhaustion_error(create_error):
+        return 0
+
+    recovery_enabled = _coerce_bool_option(os.getenv(OPENCLAW_NETWORK_POOL_RECOVERY_ENV))
+    if recovery_enabled is False:
+        return 0
+
+    keep_names = {
+        failed_network_name,
+        _resolve_isolated_control_network_name(context),
+        _resolve_private_network_name(context),
+    }
+    with _NETWORK_POOL_RECOVERY_LOCK:
+        removed_count = _remove_stale_openclaw_networks(keep_names=keep_names)
+
+    if removed_count > 0:
+        emit_progress(
+            f"[{context.instance.instance_id}] reclaimed {removed_count} stale OpenClaw Docker networks "
+            "after address-pool exhaustion",
+            component="openclaw",
+        )
+    return removed_count
+
+
 def _docker_list_container_ids_by_label(label: str) -> list[str]:
     result = _run_command(["docker", "ps", "-aq", "--filter", f"label={label}"])
     if result.returncode != 0:
@@ -852,6 +1038,137 @@ def _docker_connect_container_to_network(*, container_name: str, network_name: s
             f"Failed to connect container {container_name!r} to Docker network {network_name!r}: "
             f"{(result.stderr or result.stdout or '').strip()}"
         )
+
+
+def _normalize_proxy_upstream_base_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if not parsed.scheme or not parsed.netloc:
+        raise RuntimeError(
+            "COMPACT_BENCH_LLM_BASE_URL must be an absolute http(s) URL when using the "
+            f"{OPENCLAW_LLM_PROXY_CONTAINER_NAME!r} proxy host."
+        )
+    path = parsed.path or "/"
+    if not path.endswith("/"):
+        path = f"{path}/"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _llm_proxy_port() -> int:
+    raw = os.getenv("COMPACT_BENCH_LLM_PROXY_PORT", str(OPENCLAW_LLM_PROXY_PORT)).strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        return OPENCLAW_LLM_PROXY_PORT
+    return port if port > 0 else OPENCLAW_LLM_PROXY_PORT
+
+
+def _llm_proxy_image() -> str:
+    return os.getenv("COMPACT_BENCH_LLM_PROXY_IMAGE", OPENCLAW_LLM_PROXY_IMAGE).strip() or OPENCLAW_LLM_PROXY_IMAGE
+
+
+def _llm_proxy_container_name() -> str:
+    return (
+        os.getenv("COMPACT_BENCH_LLM_PROXY_CONTAINER_NAME", OPENCLAW_LLM_PROXY_CONTAINER_NAME).strip()
+        or OPENCLAW_LLM_PROXY_CONTAINER_NAME
+    )
+
+
+def _uses_proxy_hostname_base_url(context: RuntimeExecutionContext) -> bool:
+    base_url = str(context.llm_config.get("base_url", "")).strip()
+    if not base_url:
+        return False
+    parsed = urlsplit(base_url)
+    return (parsed.hostname or "").strip().lower() == _llm_proxy_container_name().lower()
+
+
+def _build_proxy_nginx_config(*, upstream_base_url: str, listen_port: int) -> str:
+    return "\n".join(
+        [
+            "events {}",
+            "http {",
+            "  server {",
+            f"    listen {listen_port};",
+            "    location / {",
+            f"      proxy_pass {upstream_base_url};",
+            "      proxy_http_version 1.1;",
+            "      proxy_set_header Connection \"\";",
+            "      proxy_set_header Host $proxy_host;",
+            "      proxy_set_header X-Run-Id $http_x_run_id;",
+            "      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+            "      proxy_set_header X-Forwarded-Proto $scheme;",
+            "    }",
+            "  }",
+            "}",
+            "",
+        ]
+    )
+
+
+def _ensure_llm_proxy_for_network(context: RuntimeExecutionContext, *, network_name: str) -> None:
+    if not _uses_proxy_hostname_base_url(context):
+        return
+
+    container_name = _llm_proxy_container_name()
+    with _LLM_PROXY_SETUP_LOCK:
+        if not _docker_container_running(container_name):
+            upstream = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
+            if not upstream:
+                raise RuntimeError(
+                    f"LLM base URL points to {container_name!r} but no proxy container is running. "
+                    "Set COMPACT_BENCH_LLM_BASE_URL so OpenClaw can start the local nginx proxy, "
+                    "or set LLM_BASE_URL to a directly reachable upstream endpoint."
+                )
+
+            _ensure_docker_image_available(_llm_proxy_image(), role="OpenClaw LLM proxy")
+            normalized_upstream = _normalize_proxy_upstream_base_url(upstream)
+            config_path = _state_dir(context) / "llm-proxy.nginx.conf"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(
+                _build_proxy_nginx_config(
+                    upstream_base_url=normalized_upstream,
+                    listen_port=_llm_proxy_port(),
+                ),
+                encoding="utf-8",
+            )
+
+            start = _run_command(
+                [
+                    "docker",
+                    "run",
+                    "-d",
+                    "--rm",
+                    "--name",
+                    container_name,
+                    "--network",
+                    "bridge",
+                    "-v",
+                    f"{config_path}:/etc/nginx/nginx.conf:ro",
+                    _llm_proxy_image(),
+                ]
+            )
+            if start.returncode != 0 and not _docker_container_running(container_name):
+                _docker_remove_container(container_name)
+                retry = _run_command(
+                    [
+                        "docker",
+                        "run",
+                        "-d",
+                        "--rm",
+                        "--name",
+                        container_name,
+                        "--network",
+                        "bridge",
+                        "-v",
+                        f"{config_path}:/etc/nginx/nginx.conf:ro",
+                        _llm_proxy_image(),
+                    ]
+                )
+                if retry.returncode != 0 and not _docker_container_running(container_name):
+                    message = (retry.stderr or retry.stdout or start.stderr or start.stdout or "").strip()
+                    raise RuntimeError(f"Failed to start LLM proxy container {container_name!r}: {message}")
+
+        if network_name not in {"", "bridge", "host", "none"}:
+            _docker_connect_container_to_network(container_name=container_name, network_name=network_name)
 
 
 def _run_isolated_docker_command(
@@ -1148,11 +1465,21 @@ def _ensure_private_network(context: RuntimeExecutionContext) -> tuple[str, bool
         return name, False
     if _run_command(["docker", "network", "inspect", name]).returncode == 0:
         return name, False
-    create = _run_command(["docker", "network", "create", name])
+    create = _create_docker_network(name=name, internal=False)
+    create_error = (create.stderr or create.stdout or "").strip()
+    if create.returncode != 0 and _run_command(["docker", "network", "inspect", name]).returncode != 0:
+        removed_count = _recover_openclaw_network_pool_if_needed(
+            context,
+            failed_network_name=name,
+            create_error=create_error,
+        )
+        if removed_count > 0:
+            create = _create_docker_network(name=name, internal=False)
+            create_error = (create.stderr or create.stdout or "").strip()
     if create.returncode != 0 and _run_command(["docker", "network", "inspect", name]).returncode != 0:
         raise RuntimeError(
             "Failed to create the private OpenClaw network "
-            f"{name!r}: {(create.stderr or create.stdout or '').strip()}"
+            f"{name!r}: {create_error}"
         )
     return name, True
 
@@ -1161,11 +1488,21 @@ def _ensure_isolated_control_network(context: RuntimeExecutionContext) -> tuple[
     name = _resolve_isolated_control_network_name(context)
     if _run_command(["docker", "network", "inspect", name]).returncode == 0:
         return name, False
-    create = _run_command(["docker", "network", "create", "--internal", name])
+    create = _create_docker_network(name=name, internal=True)
+    create_error = (create.stderr or create.stdout or "").strip()
+    if create.returncode != 0 and _run_command(["docker", "network", "inspect", name]).returncode != 0:
+        removed_count = _recover_openclaw_network_pool_if_needed(
+            context,
+            failed_network_name=name,
+            create_error=create_error,
+        )
+        if removed_count > 0:
+            create = _create_docker_network(name=name, internal=True)
+            create_error = (create.stderr or create.stdout or "").strip()
     if create.returncode != 0 and _run_command(["docker", "network", "inspect", name]).returncode != 0:
         raise RuntimeError(
             "Failed to create the isolated OpenClaw control network "
-            f"{name!r}: {(create.stderr or create.stdout or '').strip()}"
+            f"{name!r}: {create_error}"
         )
     return name, True
 
@@ -1224,6 +1561,13 @@ def _ensure_isolated_daemon(context: RuntimeExecutionContext) -> str:
 
     _docker_remove_container(dind_name)
     _ensure_docker_image_available(_resolve_dind_image(context), role="OpenClaw isolated Docker daemon")
+    # Mount the gateway workspace root into a stable path inside DinD.
+    # Do not mount under /tmp inside DinD: the dind image remounts /tmp as tmpfs,
+    # which can hide bind mounts rooted there (for example host /tmp/... paths).
+    # If the bind is hidden, sandbox edits don't propagate back to host and patch
+    # capture always reports no changes.
+    gateway_workspace_root = _gateway_workspace_root(context)
+    gateway_workspace_root.mkdir(parents=True, exist_ok=True)
     args = [
         "docker",
         "run",
@@ -1236,6 +1580,8 @@ def _ensure_isolated_daemon(context: RuntimeExecutionContext) -> str:
         network_name,
         "-e",
         "DOCKER_TLS_CERTDIR=",
+        "-v",
+        f"{gateway_workspace_root}:{OPENCLAW_CONTAINER_PROBLEMS_ROOT}",
         _resolve_dind_image(context),
     ]
     result = _run_command(args)
@@ -1921,6 +2267,148 @@ def _collect_openclaw_token_usage(
     return payload
 
 
+def _normalize_terminal_status(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def _extract_nonempty_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _collect_openclaw_session_outcome(
+    context: RuntimeExecutionContext,
+    *,
+    agent_id: str,
+    session_id: str,
+) -> dict[str, Any]:
+    session_file = _session_file_path(context, agent_id=agent_id, session_id=session_id)
+    trajectory_file = _session_trajectory_file_path(context, agent_id=agent_id, session_id=session_id)
+
+    trace_final_status: str | None = None
+    session_ended_status: str | None = None
+    prompt_error: str | None = None
+    prompt_error_source: str | None = None
+    timed_out: bool | None = None
+    aborted: bool | None = None
+
+    for _, row in _jsonl_rows(trajectory_file):
+        row_type = row.get("type")
+        data = row.get("data")
+        if not isinstance(data, dict):
+            continue
+
+        if row_type == "trace.artifacts":
+            candidate_status = _normalize_terminal_status(data.get("finalStatus"))
+            if candidate_status:
+                trace_final_status = candidate_status
+            candidate_error = _extract_nonempty_text(data.get("promptError"))
+            if candidate_error:
+                prompt_error = candidate_error
+                prompt_error_source = "trajectory.trace.artifacts.data.promptError"
+            candidate_timed_out = data.get("timedOut")
+            if isinstance(candidate_timed_out, bool):
+                timed_out = candidate_timed_out
+            candidate_aborted = data.get("aborted")
+            if isinstance(candidate_aborted, bool):
+                aborted = candidate_aborted
+            continue
+
+        if row_type == "session.ended":
+            candidate_status = _normalize_terminal_status(data.get("status"))
+            if candidate_status:
+                session_ended_status = candidate_status
+            candidate_error = _extract_nonempty_text(data.get("promptError"))
+            if candidate_error:
+                prompt_error = candidate_error
+                prompt_error_source = "trajectory.session.ended.data.promptError"
+            candidate_timed_out = data.get("timedOut")
+            if isinstance(candidate_timed_out, bool):
+                timed_out = candidate_timed_out
+            candidate_aborted = data.get("aborted")
+            if isinstance(candidate_aborted, bool):
+                aborted = candidate_aborted
+            continue
+
+        if row_type != "model.completed":
+            continue
+
+        candidate_error = _extract_nonempty_text(data.get("promptError"))
+        if candidate_error:
+            prompt_error = candidate_error
+            prompt_error_source = "trajectory.model.completed.data.promptError"
+        candidate_timed_out = data.get("timedOut")
+        if isinstance(candidate_timed_out, bool):
+            timed_out = candidate_timed_out
+        candidate_aborted = data.get("aborted")
+        if isinstance(candidate_aborted, bool):
+            aborted = candidate_aborted
+
+    for _, row in _jsonl_rows(session_file):
+        if row.get("type") != "custom" or row.get("customType") != "openclaw:prompt-error":
+            continue
+        data = row.get("data")
+        if not isinstance(data, dict):
+            continue
+        candidate_error = _extract_nonempty_text(data.get("error"))
+        if candidate_error:
+            prompt_error = candidate_error
+            prompt_error_source = "session.custom.openclaw:prompt-error.data.error"
+
+    resolved_status = trace_final_status or session_ended_status
+    if resolved_status is None and prompt_error:
+        resolved_status = "error"
+    is_error = bool(
+        prompt_error
+        or (resolved_status is not None and resolved_status not in {"success", "completed"})
+        or timed_out is True
+    )
+
+    return {
+        "session_file": str(session_file),
+        "trajectory_file": str(trajectory_file),
+        "trace_final_status": trace_final_status,
+        "session_ended_status": session_ended_status,
+        "resolved_status": resolved_status,
+        "prompt_error": prompt_error,
+        "prompt_error_source": prompt_error_source,
+        "timed_out": timed_out,
+        "aborted": aborted,
+        "is_error": is_error,
+    }
+
+
+def _openclaw_session_outcome_error(outcome: dict[str, Any] | None) -> str | None:
+    if not isinstance(outcome, dict):
+        return None
+
+    status = _normalize_terminal_status(outcome.get("resolved_status"))
+    prompt_error = _extract_nonempty_text(outcome.get("prompt_error"))
+    timed_out = outcome.get("timed_out") is True
+    aborted = outcome.get("aborted") is True
+    status_error = status is not None and status not in {"success", "completed"}
+    if not (status_error or prompt_error or timed_out):
+        return None
+
+    details: list[str] = []
+    if status_error:
+        details.append(f"status={status}")
+    if timed_out:
+        details.append("timed_out=true")
+    if aborted:
+        details.append("aborted=true")
+    if prompt_error:
+        details.append(f"prompt_error={prompt_error}")
+
+    detail_suffix = f": {'; '.join(details)}" if details else ""
+    return f"OpenClaw session reported a terminal error{detail_suffix}"
+
+
 def _append_unique_string(values: list[Any], value: str) -> None:
     if value not in values:
         values.append(value)
@@ -2139,9 +2627,13 @@ def _build_provider_config(context: RuntimeExecutionContext) -> dict[str, Any]:
 
 
 def _build_agent_entry(context: RuntimeExecutionContext) -> dict[str, Any]:
+    # The sandbox docker daemon runs inside DinD, so source paths in workspace/binds
+    # must be visible from inside DinD, not host-only /tmp paths.
+    container_repo_path = _container_repo_path(context)
+    container_artifacts_path = f"{_container_problem_root(context)}/artifacts"
     agent_entry = {
         "id": _build_agent_id(context),
-        "workspace": str(_repo_dir(context).resolve()),
+        "workspace": container_repo_path,
         "model": _resolve_openclaw_model(context),
         "sandbox": {
             "mode": "all",
@@ -2150,14 +2642,14 @@ def _build_agent_entry(context: RuntimeExecutionContext) -> dict[str, Any]:
             "workspaceAccess": "rw",
             "docker": {
                 "image": _resolve_benchmark_image(context),
-                "workdir": _container_repo_path(context),
+                "workdir": container_repo_path,
                 "network": _resolve_private_network_name(context),
                 "readOnlyRoot": False,
                 "dangerouslyAllowExternalBindSources": True,
                 "dangerouslyAllowReservedContainerTargets": True,
                 "env": _build_sandbox_env(context),
                 "binds": [
-                    f"{_artifacts_dir(context).resolve()}:{OPENCLAW_CONTAINER_ARTIFACTS_PATH}:rw",
+                    f"{container_artifacts_path}:{OPENCLAW_CONTAINER_ARTIFACTS_PATH}:rw",
                 ],
             },
         },
@@ -2406,6 +2898,14 @@ def _start_gateway_container(
     openclaw_user = _resolve_openclaw_user(context)
     state_dir.mkdir(parents=True, exist_ok=True)
     problems_root.mkdir(parents=True, exist_ok=True)
+    try:
+        _ensure_llm_proxy_for_network(context, network_name=network_name)
+    except Exception:
+        _teardown_isolated_daemon(context)
+        _teardown_isolated_control_network(context)
+        if network_created:
+            _docker_remove_network(network_name)
+        raise
     args = [
         "docker",
         "run",
@@ -2808,6 +3308,19 @@ def _run_openclaw_agent_request(
                 "source": "openclaw.transcript",
                 "error": str(exc),
             }
+        try:
+            metadata["session_outcome"] = _collect_openclaw_session_outcome(
+                context,
+                agent_id=agent_id,
+                session_id=session_id,
+            )
+        except Exception as exc:
+            metadata["session_outcome"] = {
+                "error": str(exc),
+            }
+        session_outcome_error = _openclaw_session_outcome_error(metadata.get("session_outcome"))
+        if session_outcome_error:
+            metadata["session_outcome_error"] = session_outcome_error
         patch_eval_dir = run_dir / "patch-eval"
         emit_progress(
             f"[{context.instance.instance_id}] capturing repository patch",
@@ -2836,7 +3349,8 @@ def _run_openclaw_agent_request(
             f"[{context.instance.instance_id}] SWE-rebench patch evaluation status: {metadata['patch_evaluation'].get('status', 'unknown')}",
             component="openclaw",
         )
-        if result.returncode == 0:
+        completed_successfully = result.returncode == 0 and session_outcome_error is None
+        if completed_successfully:
             return RuntimeExecutionResult(
                 benchmark_id=context.instance.benchmark_id,
                 instance_id=context.instance.instance_id,
@@ -2845,12 +3359,18 @@ def _run_openclaw_agent_request(
                 metadata=metadata,
             )
 
+        runtime_error = error_summary
+        if result.returncode == 0 and session_outcome_error:
+            runtime_error = session_outcome_error
+        elif session_outcome_error and session_outcome_error not in runtime_error:
+            runtime_error = f"{runtime_error}; {session_outcome_error}"
+
         return RuntimeExecutionResult(
             benchmark_id=context.instance.benchmark_id,
             instance_id=context.instance.instance_id,
             backend_name=context.backend_name,
             status="runtime-error",
-            error=error_summary,
+            error=runtime_error,
             metadata=metadata,
         )
     finally:

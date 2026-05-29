@@ -19,7 +19,7 @@ from typing import Any
 from .base import RuntimeBackend, RuntimeExecutionContext, RuntimeExecutionResult
 from ..progress import emit_progress
 from ..swebench_images import resolve_benchmark_runtime_image
-from ..swerebench_eval import capture_repo_patch, maybe_run_swerebench_evaluation
+from ..swerebench_eval import OPENCLAW_PATCH_EXCLUDE_PATHS, capture_repo_patch, maybe_run_swerebench_evaluation
 from ..swebench_images import resolve_benchmark_runtime_image
 
 OPENCLAW_WORKSPACE_ERROR = (
@@ -859,6 +859,102 @@ def _run_isolated_docker_command(
     args: list[str],
 ) -> subprocess.CompletedProcess[str]:
     return _run_command(["docker", "exec", _dind_container_name(context), "docker", *args])
+
+
+def _capture_repo_patch_from_isolated_daemon(
+    context: RuntimeExecutionContext,
+    *,
+    output_dir: Path,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    repo_dir = _repo_dir(context).resolve()
+    patch_path = output_dir / "agent.patch"
+    payload: dict[str, Any] = {
+        "status": "skipped-no-git",
+        "repo_dir": str(repo_dir),
+        "patch_path": str(patch_path),
+        "has_changes": False,
+        "line_count": 0,
+        "size_bytes": 0,
+        "source": "isolated-dind",
+    }
+    if not _docker_container_running(_dind_container_name(context)):
+        patch_path.write_text("", encoding="utf-8")
+        payload["status"] = "skipped-no-dind"
+        return payload
+
+    repo_path = str(repo_dir)
+    repo_arg = shlex.quote(repo_path)
+    git_dir_arg = shlex.quote(str(repo_dir / ".git"))
+    exclude_args = " ".join(
+        shlex.quote(f":(exclude){path}") for path in OPENCLAW_PATCH_EXCLUDE_PATHS
+    )
+    shell_command = (
+        f"if [ ! -d {git_dir_arg} ]; then exit 3; fi\n"
+        f"git -c safe.directory={repo_arg} -C {repo_arg} add -N --all\n"
+        f"git -c safe.directory={repo_arg} -C {repo_arg} -c core.fileMode=false diff "
+        "--binary --full-index --no-ext-diff HEAD -- ."
+    )
+    if exclude_args:
+        shell_command = f"{shell_command} {exclude_args}"
+
+    run_args = [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--entrypoint",
+        "sh",
+        "-v",
+        f"{repo_path}:{repo_path}:rw",
+    ]
+    workspace_user = _resolve_workspace_container_user(context)
+    if workspace_user is not None:
+        run_args.extend(["--user", workspace_user])
+    run_args.extend([_resolve_benchmark_image(context), "-lc", shell_command])
+
+    diff_result = _run_isolated_docker_command(context, run_args)
+    if diff_result.returncode == 3:
+        patch_path.write_text("", encoding="utf-8")
+        return payload
+
+    patch_text = diff_result.stdout or ""
+    patch_path.write_text(patch_text, encoding="utf-8")
+    payload.update(
+        {
+            "status": "captured" if diff_result.returncode == 0 else "error",
+            "has_changes": bool(patch_text.strip()),
+            "line_count": len(patch_text.splitlines()),
+            "size_bytes": len(patch_text.encode("utf-8")),
+        }
+    )
+    if diff_result.returncode != 0:
+        payload["error"] = (
+            diff_result.stderr or diff_result.stdout or "git diff in isolated daemon failed"
+        ).strip()
+    return payload
+
+
+def _capture_repo_patch_with_dind_fallback(
+    context: RuntimeExecutionContext,
+    *,
+    output_dir: Path,
+) -> dict[str, Any]:
+    host_patch = capture_repo_patch(repo_dir=_repo_dir(context), output_dir=output_dir)
+    host_patch.setdefault("source", "host")
+    if host_patch.get("has_changes"):
+        return host_patch
+
+    dind_patch = _capture_repo_patch_from_isolated_daemon(context, output_dir=output_dir)
+    host_patch["fallback_attempted"] = True
+    host_patch["fallback_status"] = dind_patch.get("status")
+    if dind_patch.get("error"):
+        host_patch["fallback_error"] = dind_patch.get("error")
+    if dind_patch.get("has_changes"):
+        dind_patch["fallback_from_source"] = "host"
+        dind_patch["fallback_from_status"] = host_patch.get("status")
+        return dind_patch
+    return host_patch
 
 
 def _isolated_docker_list_container_ids_by_label(
@@ -2813,7 +2909,7 @@ def _run_openclaw_agent_request(
             f"[{context.instance.instance_id}] capturing repository patch",
             component="openclaw",
         )
-        patch_capture = capture_repo_patch(repo_dir=_repo_dir(context), output_dir=patch_eval_dir)
+        patch_capture = _capture_repo_patch_with_dind_fallback(context, output_dir=patch_eval_dir)
         metadata["patch_capture"] = patch_capture
         emit_progress(
             f"[{context.instance.instance_id}] patch capture status: {patch_capture.get('status')} changes={patch_capture.get('has_changes')}",

@@ -76,6 +76,12 @@ OPENCLAW_NETWORK_SUBNET_ATTEMPTS_ENV = "SOMA_OPENCLAW_NETWORK_SUBNET_ATTEMPTS"
 OPENCLAW_NETWORK_DEFAULT_POOL_CIDR = "100.96.0.0/11"
 OPENCLAW_NETWORK_DEFAULT_SUBNET_PREFIX = 24
 OPENCLAW_NETWORK_DEFAULT_SUBNET_ATTEMPTS = 32
+OPENCLAW_STALE_DIND_MAX_AGE_ENV = "SOMA_OPENCLAW_STALE_DIND_MAX_AGE_SECONDS"
+OPENCLAW_STALE_WORKSPACE_MAX_AGE_ENV = "SOMA_OPENCLAW_STALE_WORKSPACE_MAX_AGE_SECONDS"
+OPENCLAW_STALE_RESOURCE_CLEANUP_INTERVAL_ENV = "SOMA_OPENCLAW_STALE_RESOURCE_CLEANUP_INTERVAL_SECONDS"
+OPENCLAW_DEFAULT_STALE_DIND_MAX_AGE_SECONDS = 30 * 60
+OPENCLAW_DEFAULT_STALE_WORKSPACE_MAX_AGE_SECONDS = 24 * 60 * 60
+OPENCLAW_DEFAULT_STALE_RESOURCE_CLEANUP_INTERVAL_SECONDS = 60
 _PLUGIN_REINSTALLED_FOR_RUNS: set[str] = set()
 _GATEWAY_RECOVERY_LOCK = threading.Lock()
 _GATEWAY_RECOVERY_LOCKS: dict[str, threading.Lock] = {}
@@ -83,6 +89,8 @@ _COMPRESSION_SERVICE_STATE: dict[str, str] = {}  # gateway_name -> service URL
 _COMPRESSION_SERVICE_STATE_LOCK = threading.Lock()
 _LLM_PROXY_SETUP_LOCK = threading.Lock()
 _NETWORK_POOL_RECOVERY_LOCK = threading.Lock()
+_STALE_RESOURCE_CLEANUP_LOCK = threading.Lock()
+_LAST_STALE_RESOURCE_CLEANUP_MONOTONIC = 0.0
 _WS_CLOSE_RE = re.compile(
     r"gateway closed \((?P<code>\d{3,4})\s+(?P<reason>[^)]*)\)",
     re.IGNORECASE,
@@ -805,6 +813,40 @@ def _docker_container_running(name: str) -> bool:
     return result.returncode == 0 and (result.stdout or "").strip().lower() == "true"
 
 
+def _docker_container_exists(name: str) -> bool:
+    return _run_command(["docker", "inspect", name]).returncode == 0
+
+
+def _docker_list_container_names() -> list[str]:
+    result = _run_command(["docker", "ps", "-a", "--format", "{{.Names}}"])
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def _docker_container_created_epoch(name: str) -> float | None:
+    result = _run_command(["docker", "inspect", "-f", "{{.Created}}", name])
+    if result.returncode != 0:
+        return None
+
+    created_value = (result.stdout or "").strip()
+    if not created_value:
+        return None
+
+    normalized = created_value
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    # Docker can emit nanosecond precision; datetime.fromisoformat supports microseconds.
+    normalized = re.sub(r"\.(\d{6})\d+(?=[+-]\d{2}:\d{2}$)", r".\1", normalized)
+    try:
+        created = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return created.timestamp()
+
+
 def _docker_image_exists(image_ref: str) -> bool:
     result = _run_command(["docker", "image", "inspect", image_ref])
     return result.returncode == 0
@@ -825,7 +867,8 @@ def _ensure_docker_image_available(image_ref: str, *, role: str) -> None:
 
 
 def _docker_remove_container(name: str) -> None:
-    _run_command(["docker", "rm", "-f", name])
+    # Remove anonymous volumes too (DinD uses large anonymous volumes by default).
+    _run_command(["docker", "rm", "-f", "-v", name])
 
 
 def _docker_remove_network(name: str) -> None:
@@ -973,6 +1016,129 @@ def _remove_stale_openclaw_networks(*, keep_names: set[str]) -> int:
     return removed
 
 
+def _resolve_stale_dind_max_age_seconds() -> int:
+    return _coerce_positive_int(
+        os.getenv(OPENCLAW_STALE_DIND_MAX_AGE_ENV),
+        OPENCLAW_DEFAULT_STALE_DIND_MAX_AGE_SECONDS,
+    )
+
+
+def _resolve_stale_workspace_max_age_seconds() -> int:
+    return _coerce_positive_int(
+        os.getenv(OPENCLAW_STALE_WORKSPACE_MAX_AGE_ENV),
+        OPENCLAW_DEFAULT_STALE_WORKSPACE_MAX_AGE_SECONDS,
+    )
+
+
+def _resolve_stale_resource_cleanup_interval_seconds() -> int:
+    return _coerce_positive_int(
+        os.getenv(OPENCLAW_STALE_RESOURCE_CLEANUP_INTERVAL_ENV),
+        OPENCLAW_DEFAULT_STALE_RESOURCE_CLEANUP_INTERVAL_SECONDS,
+    )
+
+
+def _remove_stale_openclaw_dind_containers(*, keep_names: set[str]) -> int:
+    max_age_seconds = _resolve_stale_dind_max_age_seconds()
+    now_epoch = time.time()
+    removed = 0
+
+    for dind_name in _docker_list_container_names():
+        if dind_name in keep_names:
+            continue
+        if not dind_name.startswith(OPENCLAW_CONTROL_NETWORK_PREFIX) or not dind_name.endswith("-dind"):
+            continue
+
+        gateway_name = dind_name[: -len("-dind")]
+        if _docker_container_running(gateway_name):
+            continue
+
+        created_epoch = _docker_container_created_epoch(dind_name)
+        if created_epoch is not None and now_epoch - created_epoch < max_age_seconds:
+            continue
+
+        _docker_remove_container(dind_name)
+        if not _docker_container_exists(dind_name):
+            removed += 1
+
+    return removed
+
+
+def _remove_stale_openclaw_workspaces(
+    context: RuntimeExecutionContext,
+    *,
+    keep_paths: set[Path],
+) -> int:
+    max_age_seconds = _resolve_stale_workspace_max_age_seconds()
+    now_epoch = time.time()
+    removed = 0
+
+    problem_root = _problem_root(context)
+    workspace_base_root = problem_root.parent.parent
+    if not workspace_base_root.is_dir():
+        return 0
+
+    normalized_keep_paths: set[Path] = set()
+    for candidate in keep_paths:
+        try:
+            normalized_keep_paths.add(candidate.resolve())
+        except OSError:
+            normalized_keep_paths.add(candidate)
+
+    for candidate in workspace_base_root.iterdir():
+        if not candidate.is_dir():
+            continue
+        if not candidate.name.startswith("run-"):
+            continue
+
+        candidate_resolved: Path
+        try:
+            candidate_resolved = candidate.resolve()
+        except OSError:
+            candidate_resolved = candidate
+        if candidate_resolved in normalized_keep_paths:
+            continue
+
+        try:
+            modified_epoch = candidate.stat().st_mtime
+        except OSError:
+            continue
+        if now_epoch - modified_epoch < max_age_seconds:
+            continue
+
+        shutil.rmtree(candidate, ignore_errors=True)
+        if not candidate.exists():
+            removed += 1
+
+    return removed
+
+
+def _maybe_cleanup_stale_openclaw_resources(context: RuntimeExecutionContext) -> None:
+    interval_seconds = _resolve_stale_resource_cleanup_interval_seconds()
+    now_monotonic = time.monotonic()
+    global _LAST_STALE_RESOURCE_CLEANUP_MONOTONIC
+    with _STALE_RESOURCE_CLEANUP_LOCK:
+        if now_monotonic - _LAST_STALE_RESOURCE_CLEANUP_MONOTONIC < interval_seconds:
+            return
+        _LAST_STALE_RESOURCE_CLEANUP_MONOTONIC = now_monotonic
+
+    keep_dind_names = {_dind_container_name(context)}
+    keep_network_names = {
+        _resolve_isolated_control_network_name(context),
+        _resolve_private_network_name(context),
+    }
+    keep_workspace_paths = {_gateway_workspace_root(context)}
+
+    removed_dinds = _remove_stale_openclaw_dind_containers(keep_names=keep_dind_names)
+    removed_networks = _remove_stale_openclaw_networks(keep_names=keep_network_names)
+    removed_workspaces = _remove_stale_openclaw_workspaces(context, keep_paths=keep_workspace_paths)
+    if removed_dinds or removed_networks or removed_workspaces:
+        emit_progress(
+            f"[{context.instance.instance_id}] cleaned stale OpenClaw resources "
+            f"(dind={removed_dinds}, networks={removed_networks}, workspaces={removed_workspaces})",
+            component="openclaw",
+        )
+
+
 def _recover_openclaw_network_pool_if_needed(
     context: RuntimeExecutionContext,
     *,
@@ -992,12 +1158,16 @@ def _recover_openclaw_network_pool_if_needed(
         _resolve_private_network_name(context),
     }
     with _NETWORK_POOL_RECOVERY_LOCK:
-        removed_count = _remove_stale_openclaw_networks(keep_names=keep_names)
+        removed_dind_count = _remove_stale_openclaw_dind_containers(
+            keep_names={_dind_container_name(context)},
+        )
+        removed_network_count = _remove_stale_openclaw_networks(keep_names=keep_names)
+    removed_count = removed_dind_count + removed_network_count
 
     if removed_count > 0:
         emit_progress(
-            f"[{context.instance.instance_id}] reclaimed {removed_count} stale OpenClaw Docker networks "
-            "after address-pool exhaustion",
+            f"[{context.instance.instance_id}] reclaimed stale OpenClaw resources after address-pool exhaustion "
+            f"(dind={removed_dind_count}, networks={removed_network_count})",
             component="openclaw",
         )
     return removed_count
@@ -1189,7 +1359,7 @@ def _isolated_docker_list_container_ids_by_label(
 
 
 def _isolated_docker_remove_container(context: RuntimeExecutionContext, name: str) -> None:
-    _run_isolated_docker_command(context, ["rm", "-f", name])
+    _run_isolated_docker_command(context, ["rm", "-f", "-v", name])
 
 
 # ---------------------------------------------------------------------------
@@ -3064,6 +3234,7 @@ def _runtime_error_result(context: RuntimeExecutionContext, exc: Exception) -> R
     )
 
 def _prepare_openclaw_context(context: RuntimeExecutionContext) -> None:
+    _maybe_cleanup_stale_openclaw_resources(context)
     emit_progress(
         f"[{context.instance.instance_id}] ensuring benchmark image {_resolve_benchmark_image(context)}",
         component="openclaw",
@@ -3427,8 +3598,9 @@ def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionR
             plugin_runtime=plugin_runtime,
         )
     finally:
-        if gateway_started and not keep_gateway:
-            _docker_remove_container(gateway_name)
+        if not keep_gateway:
+            if gateway_started:
+                _docker_remove_container(gateway_name)
             _teardown_compression_service(context)
             _teardown_isolated_daemon(context)
             _teardown_isolated_control_network(context)
@@ -3539,8 +3711,9 @@ def run_openclaw_batch(
                     results[index] = _runtime_error_result(contexts[index], exc)
         return [result for result in results if result is not None]
     finally:
-        if gateway_started and not keep_gateway:
-            _docker_remove_container(gateway_name)
+        if not keep_gateway:
+            if gateway_started:
+                _docker_remove_container(gateway_name)
             _teardown_compression_service(primary)
             _teardown_isolated_daemon(primary)
             _teardown_isolated_control_network(primary)

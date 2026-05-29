@@ -77,9 +77,11 @@ OPENCLAW_NETWORK_DEFAULT_POOL_CIDR = "100.96.0.0/11"
 OPENCLAW_NETWORK_DEFAULT_SUBNET_PREFIX = 24
 OPENCLAW_NETWORK_DEFAULT_SUBNET_ATTEMPTS = 32
 OPENCLAW_STALE_DIND_MAX_AGE_ENV = "SOMA_OPENCLAW_STALE_DIND_MAX_AGE_SECONDS"
+OPENCLAW_STALE_NETWORK_MAX_AGE_ENV = "SOMA_OPENCLAW_STALE_NETWORK_MAX_AGE_SECONDS"
 OPENCLAW_STALE_WORKSPACE_MAX_AGE_ENV = "SOMA_OPENCLAW_STALE_WORKSPACE_MAX_AGE_SECONDS"
 OPENCLAW_STALE_RESOURCE_CLEANUP_INTERVAL_ENV = "SOMA_OPENCLAW_STALE_RESOURCE_CLEANUP_INTERVAL_SECONDS"
 OPENCLAW_DEFAULT_STALE_DIND_MAX_AGE_SECONDS = 30 * 60
+OPENCLAW_DEFAULT_STALE_NETWORK_MAX_AGE_SECONDS = 30 * 60
 OPENCLAW_DEFAULT_STALE_WORKSPACE_MAX_AGE_SECONDS = 24 * 60 * 60
 OPENCLAW_DEFAULT_STALE_RESOURCE_CLEANUP_INTERVAL_SECONDS = 60
 _PLUGIN_REINSTALLED_FOR_RUNS: set[str] = set()
@@ -824,6 +826,49 @@ def _docker_list_container_names() -> list[str]:
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
 
+def _parse_docker_timestamp_epoch(raw_value: str) -> float | None:
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    # Common inspect format, e.g. 2026-05-29T13:23:00.123456789Z
+    normalized = value
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    normalized = re.sub(r"\.(\d{6})\d+(?=(?:[+-]\d{2}:\d{2})$)", r".\1", normalized)
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
+    # Docker network inspect format, e.g. 2026-05-22 06:28:45.205872017 +0000 UTC
+    match = re.match(
+        r"^(?P<base>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(?P<fraction>\d+))? (?P<offset>[+-]\d{4})(?: [A-Z]{2,5})?$",
+        value,
+    )
+    if match is None:
+        return None
+    base = match.group("base")
+    fraction = match.group("fraction") or ""
+    offset = match.group("offset")
+    if fraction:
+        microseconds = fraction[:6].ljust(6, "0")
+        timestamp = f"{base}.{microseconds} {offset}"
+        format_string = "%Y-%m-%d %H:%M:%S.%f %z"
+    else:
+        timestamp = f"{base} {offset}"
+        format_string = "%Y-%m-%d %H:%M:%S %z"
+    try:
+        parsed = datetime.strptime(timestamp, format_string)
+    except ValueError:
+        return None
+    return parsed.timestamp()
+
+
 def _docker_container_created_epoch(name: str) -> float | None:
     result = _run_command(["docker", "inspect", "-f", "{{.Created}}", name])
     if result.returncode != 0:
@@ -832,19 +877,17 @@ def _docker_container_created_epoch(name: str) -> float | None:
     created_value = (result.stdout or "").strip()
     if not created_value:
         return None
+    return _parse_docker_timestamp_epoch(created_value)
 
-    normalized = created_value
-    if normalized.endswith("Z"):
-        normalized = f"{normalized[:-1]}+00:00"
-    # Docker can emit nanosecond precision; datetime.fromisoformat supports microseconds.
-    normalized = re.sub(r"\.(\d{6})\d+(?=[+-]\d{2}:\d{2}$)", r".\1", normalized)
-    try:
-        created = datetime.fromisoformat(normalized)
-    except ValueError:
+
+def _docker_network_created_epoch(name: str) -> float | None:
+    result = _run_command(["docker", "network", "inspect", "-f", "{{.Created}}", name])
+    if result.returncode != 0:
         return None
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    return created.timestamp()
+    created_value = (result.stdout or "").strip()
+    if not created_value:
+        return None
+    return _parse_docker_timestamp_epoch(created_value)
 
 
 def _docker_image_exists(image_ref: str) -> bool:
@@ -924,6 +967,11 @@ def _is_docker_network_subnet_conflict_error(message: str) -> bool:
     )
 
 
+def _is_docker_network_not_found_error(message: str) -> bool:
+    normalized = message.lower()
+    return "network" in normalized and "not found" in normalized
+
+
 def _resolve_openclaw_network_pool() -> tuple[ipaddress.IPv4Network, int, int]:
     raw_pool = os.getenv(OPENCLAW_NETWORK_POOL_CIDR_ENV, OPENCLAW_NETWORK_DEFAULT_POOL_CIDR).strip()
     if not raw_pool:
@@ -1001,14 +1049,28 @@ def _create_docker_network(
 
 
 def _remove_stale_openclaw_networks(*, keep_names: set[str]) -> int:
+    max_age_seconds = _resolve_stale_network_max_age_seconds()
+    now_epoch = time.time()
     removed = 0
     for candidate in _docker_list_network_names():
         if candidate in keep_names:
             continue
         if not _is_openclaw_ephemeral_network_name(candidate):
             continue
+        gateway_name = _openclaw_gateway_name_for_network(candidate)
+        if gateway_name is not None:
+            dind_name = f"{gateway_name}-dind"
+            # Avoid racing with fresh or currently-starting OpenClaw resources.
+            if _docker_container_exists(gateway_name) or _docker_container_exists(dind_name):
+                continue
         container_count = _docker_network_container_count(candidate)
         if container_count != 0:
+            continue
+        created_epoch = _docker_network_created_epoch(candidate)
+        if created_epoch is None:
+            # Be conservative when timestamps are unavailable.
+            continue
+        if now_epoch - created_epoch < max_age_seconds:
             continue
         remove = _run_command(["docker", "network", "rm", candidate])
         if remove.returncode == 0:
@@ -1020,6 +1082,13 @@ def _resolve_stale_dind_max_age_seconds() -> int:
     return _coerce_positive_int(
         os.getenv(OPENCLAW_STALE_DIND_MAX_AGE_ENV),
         OPENCLAW_DEFAULT_STALE_DIND_MAX_AGE_SECONDS,
+    )
+
+
+def _resolve_stale_network_max_age_seconds() -> int:
+    return _coerce_positive_int(
+        os.getenv(OPENCLAW_STALE_NETWORK_MAX_AGE_ENV),
+        OPENCLAW_DEFAULT_STALE_NETWORK_MAX_AGE_SECONDS,
     )
 
 
@@ -1061,6 +1130,19 @@ def _remove_stale_openclaw_dind_containers(*, keep_names: set[str]) -> int:
             removed += 1
 
     return removed
+
+
+def _openclaw_gateway_name_for_network(network_name: str) -> str | None:
+    if network_name.startswith(OPENCLAW_CONTROL_NETWORK_PREFIX) and network_name.endswith(OPENCLAW_CONTROL_NETWORK_SUFFIX):
+        gateway_name = network_name[: -len(OPENCLAW_CONTROL_NETWORK_SUFFIX)]
+        return gateway_name if gateway_name else None
+
+    if network_name.startswith(OPENCLAW_PRIVATE_NETWORK_PREFIX):
+        digest = network_name[len(OPENCLAW_PRIVATE_NETWORK_PREFIX):]
+        if digest:
+            return f"{OPENCLAW_CONTROL_NETWORK_PREFIX}{digest}"
+
+    return None
 
 
 def _remove_stale_openclaw_workspaces(
@@ -1755,12 +1837,19 @@ def _ensure_isolated_daemon(context: RuntimeExecutionContext) -> str:
         _resolve_dind_image(context),
     ]
     result = _run_command(args)
+    result_error = (result.stderr or result.stdout or "").strip()
+    if result.returncode != 0 and _is_docker_network_not_found_error(result_error):
+        # Another concurrent cleanup may have removed the control network between
+        # ensure+run; recreate and retry once.
+        _ensure_isolated_control_network(context)
+        result = _run_command(args)
+        result_error = (result.stderr or result.stdout or "").strip()
     if result.returncode != 0:
         if network_created:
             _docker_remove_network(network_name)
         raise RuntimeError(
             "Failed to start the OpenClaw isolated Docker daemon: "
-            f"{(result.stderr or result.stdout or '').strip()}"
+            f"{result_error}"
         )
 
     _wait_for_isolated_daemon_ready(dind_name=dind_name)

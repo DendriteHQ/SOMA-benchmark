@@ -55,6 +55,8 @@ OPENCLAW_WS_WATCHDOG_MAX_RETRIES = 5
 OPENCLAW_WS_WATCHDOG_DEFAULT_BACKOFF_SECONDS = 1.0
 OPENCLAW_WS_WATCHDOG_MAX_BACKOFF_SECONDS = 10.0
 OPENCLAW_HEARTBEAT_DISABLED_INTERVAL = "0m"
+OPENCLAW_PROVIDER_TIMEOUT_SECONDS_ENV = "SOMA_OPENCLAW_PROVIDER_TIMEOUT_SECONDS"
+OPENCLAW_DEFAULT_PROVIDER_TIMEOUT_SECONDS = 240
 OPENCLAW_GATEWAY_PIDS_LIMIT = 4096
 OPENCLAW_GATEWAY_ULIMIT_NOFILE = "4096"
 COMPRESSION_SERVICE_IMAGE_NAME = "soma-compression-service:latest"
@@ -2880,6 +2882,13 @@ def _build_provider_config(context: RuntimeExecutionContext) -> dict[str, Any]:
         run_id_header_value = _resolve_run_id_header_value(context)
         if run_id_header_value:
             openai_provider["headers"] = {"X-Run-Id": run_id_header_value}
+        _provider_timeout_raw = os.getenv(OPENCLAW_PROVIDER_TIMEOUT_SECONDS_ENV)
+        try:
+            _provider_timeout_val = int(_provider_timeout_raw) if _provider_timeout_raw is not None else OPENCLAW_DEFAULT_PROVIDER_TIMEOUT_SECONDS
+        except (TypeError, ValueError):
+            _provider_timeout_val = OPENCLAW_DEFAULT_PROVIDER_TIMEOUT_SECONDS
+        if _provider_timeout_val > 0:
+            openai_provider["timeoutSeconds"] = _provider_timeout_val
         providers["openai"] = openai_provider
 
     return providers

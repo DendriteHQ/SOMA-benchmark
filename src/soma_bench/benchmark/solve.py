@@ -30,6 +30,33 @@ def _append_jsonl_row(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=True) + "\n")
 
 
+def _load_batch_input(path: str | Path) -> tuple[str, list[dict[str, Any]]]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Batch input must be a JSON object")
+    batch_id = str(payload.get("batch_id") or "batch").strip() or "batch"
+    tasks_raw = payload.get("tasks")
+    if not isinstance(tasks_raw, list) or not tasks_raw:
+        raise ValueError("Batch input must contain a non-empty 'tasks' list")
+    tasks: list[dict[str, Any]] = []
+    for raw in tasks_raw:
+        if not isinstance(raw, dict):
+            raise ValueError("Each batch task must be a JSON object")
+        run_id = raw.get("run_id")
+        benchmark = raw.get("benchmark")
+        instance_id = raw.get("instance_id")
+        if run_id is None or not str(benchmark or "").strip() or not str(instance_id or "").strip():
+            raise ValueError("Each batch task requires run_id, benchmark, and instance_id")
+        task = dict(raw)
+        task["run_id"] = int(run_id)
+        task["benchmark"] = str(benchmark).strip()
+        task["instance_id"] = str(instance_id).strip()
+        if not str(task.get("benchmark_id") or "").strip():
+            task["benchmark_id"] = f"{task['instance_id']}-run-{task['run_id']}"
+        tasks.append(task)
+    return batch_id, tasks
+
+
 def _build_problem_statement(runtime_setup_entry: dict[str, Any]) -> str:
     hidden_eval = runtime_setup_entry.get("hidden_eval")
     if not isinstance(hidden_eval, dict):
@@ -118,7 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Benchmark dataset identifier, for example 'nebius/SWE-rebench' or 'SWE-bench/SWE-bench_Verified'.",
     )
-    parser.add_argument("--instance-id", required=True, help="Concrete benchmark instance identifier.")
+    parser.add_argument("--instance-id", required=False, help="Concrete benchmark instance identifier.")
+    parser.add_argument(
+        "--batch-input-json",
+        default=None,
+        help="Optional path to batch input JSON produced by sandbox_service.",
+    )
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -222,6 +254,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.batch_input_json:
+        return _run_batch_mode(args)
+    if not args.instance_id:
+        parser.error("--instance-id is required when --batch-input-json is not provided")
 
     repo_root = Path(__file__).resolve().parents[3]
     emit_progress(
@@ -435,6 +472,238 @@ def main(argv: list[str] | None = None) -> int:
         },
     }
     print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _run_batch_mode(args: argparse.Namespace) -> int:
+    batch_id, batch_tasks = _load_batch_input(args.batch_input_json)
+    repo_root = Path(__file__).resolve().parents[3]
+
+    first_task = batch_tasks[0]
+    emit_progress(
+        f"resolving benchmark metadata for batch {batch_id} with {len(batch_tasks)} task(s)",
+        component="benchmark-solve",
+    )
+    resolved_primary = resolve_runner_config(
+        repo_root=repo_root,
+        agent_name=args.agent_name,
+        model=args.model,
+        benchmark_name=str(first_task["benchmark"]),
+        selection_id=str(first_task["instance_id"]),
+        ignore_api_key=args.openclaw_ignore_api_key,
+    )
+    if resolved_primary.agent.runtime_backend not in list_runtime_backends():
+        available = ", ".join(sorted(list_runtime_backends()))
+        raise ValueError(
+            f"Unsupported runtime backend resolved from agent '{args.agent_name}': "
+            f"{resolved_primary.agent.runtime_backend}. Available backends: {available}"
+        )
+
+    runtime_backend = get_runtime_backend(resolved_primary.agent.runtime_backend)
+    image = runtime_backend.default_image
+    target = runtime_backend.default_build_target
+    output_dir = Path(args.output_dir) if args.output_dir else resolved_primary.benchmark.output_dir
+    execute = args.execute or resolved_primary.benchmark.execute
+    concurrency = (
+        resolve_benchmark_concurrency(args.concurrency)
+        if args.concurrency is not None
+        else resolved_primary.benchmark.concurrency
+    )
+    benchmark_config = replace(
+        resolved_primary.benchmark,
+        output_dir=output_dir,
+        execute=execute,
+        concurrency=concurrency,
+    )
+
+    runtime_options_common = _build_runtime_options(
+        openclaw_command=args.openclaw_command,
+        openclaw_container_image=args.openclaw_container_image,
+        openclaw_current_user=args.openclaw_current_user,
+        openclaw_run_id_header_value=args.openclaw_run_id_header_value,
+        openclaw_ignore_api_key=args.openclaw_ignore_api_key,
+        openclaw_plugin_path=args.openclaw_plugin_path,
+        openclaw_disable_plugin=args.openclaw_disable_plugin,
+        openclaw_plugin_reinstall_on_run_start=args.openclaw_plugin_reinstall_on_run_start,
+        swerebench_eval=args.swerebench_eval,
+        swerebench_split=benchmark_config.split,
+        swerebench_harness_root=args.swerebench_harness_root,
+        swerebench_harness_python=args.swerebench_harness_python,
+        swerebench_namespace=args.swerebench_namespace,
+        swerebench_cache_level=args.swerebench_cache_level,
+        swerebench_timeout=args.swerebench_timeout,
+        swerebench_max_workers=args.swerebench_max_workers,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_output_file = output_dir / "benchmark-manifest.jsonl"
+    image_plan_output_file = output_dir / "image-plan.json"
+    eval_output_file = output_dir / "evaluation-summary.json"
+
+    manifest_rows: list[dict[str, Any]] = []
+    runtime_options_by_benchmark_id: dict[str, dict[str, Any]] = {}
+    benchmark_to_run_id: dict[str, int] = {}
+    for task in batch_tasks:
+        resolved_task = resolve_runner_config(
+            repo_root=repo_root,
+            agent_name=args.agent_name,
+            model=args.model,
+            benchmark_name=str(task["benchmark"]),
+            selection_id=str(task["instance_id"]),
+            ignore_api_key=args.openclaw_ignore_api_key,
+        )
+        benchmark_id = str(task["benchmark_id"])
+        task_runtime_options = dict(runtime_options_common)
+        runtime_override = task.get("runtime_options")
+        if isinstance(runtime_override, dict):
+            task_runtime_options.update(runtime_override)
+
+        row = build_direct_manifest_row(
+            benchmark_name=str(task["benchmark"]),
+            instance_id=str(task["instance_id"]),
+            runtime_setup_entry=resolved_task.benchmark.runtime_setup_entry,
+            runtime_options=task_runtime_options,
+        )
+        row["benchmark_id"] = benchmark_id
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        metadata.update(
+            {
+                "batch_id": batch_id,
+                "batch_run_id": int(task["run_id"]),
+            }
+        )
+        row["metadata"] = metadata
+        manifest_rows.append(row)
+        runtime_options_by_benchmark_id[benchmark_id] = task_runtime_options
+        benchmark_to_run_id[benchmark_id] = int(task["run_id"])
+
+    write_jsonl(manifest_output_file, manifest_rows)
+    instances = load_manifest(manifest_output_file)
+    image_plan = build_image_plan(instances, image=image, target=target)
+    _write_json(
+        image_plan_output_file,
+        {
+            "dataset": str(manifest_output_file),
+            "split": benchmark_config.split,
+            "dataset_config": benchmark_config.dataset_config,
+            "runtime_backend": runtime_backend.name,
+            "instance_count": len(image_plan),
+            "image": image,
+            "target": target,
+            "planned_images": image_plan,
+            "batch_id": batch_id,
+        },
+    )
+
+    run_plan = build_run_plan(
+        instances,
+        workspace=benchmark_config.workspace,
+        agent_image=image,
+        build_target=target,
+        runtime_options=runtime_options_common,
+    )
+    for item in run_plan:
+        benchmark_id = str(item["benchmark_id"])
+        item["runtime_options"] = dict(runtime_options_by_benchmark_id.get(benchmark_id, runtime_options_common))
+
+    run_plan_path = output_dir / "run-plan.json"
+    run_plan_path.write_text(
+        json.dumps(
+            {
+                "dataset": str(manifest_output_file),
+                "split": benchmark_config.split,
+                "dataset_config": benchmark_config.dataset_config,
+                "runtime_backend": runtime_backend.name,
+                "workspace": benchmark_config.workspace,
+                "max_iterations": benchmark_config.max_iterations,
+                "concurrency": benchmark_config.concurrency,
+                "instance_count": len(run_plan),
+                "llm": {
+                    "model": resolved_primary.llm_config.get("model"),
+                    "base_url": resolved_primary.llm_config.get("base_url"),
+                },
+                "execution_mode": "backend-execution" if benchmark_config.execute else "scaffold-only",
+                "source": {
+                    "type": "batch-problem-statement",
+                    "batch_id": batch_id,
+                },
+                "runtime_options": runtime_options_common,
+                "run_plan": run_plan,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    output_json = default_output_path(output_dir)
+    output_json.write_text("", encoding="utf-8")
+
+    result_rows: list[dict[str, Any]] = []
+    evaluation_summary: dict[str, Any] | None = None
+    if benchmark_config.execute:
+        contexts: list[RuntimeExecutionContext] = []
+        instance_index = {instance.benchmark_id: instance for instance in instances}
+        for item in run_plan:
+            instance = instance_index[item["benchmark_id"]]
+            instance_dir = output_dir / "instances" / item["benchmark_id"]
+            instance_dir.mkdir(parents=True, exist_ok=True)
+            contexts.append(
+                RuntimeExecutionContext(
+                    backend_name=runtime_backend.name,
+                    instance=instance,
+                    run_payload=item,
+                    llm_config=resolved_primary.llm_config,
+                    workspace=benchmark_config.workspace,
+                    max_iterations=benchmark_config.max_iterations,
+                    output_dir=output_dir,
+                    instance_dir=instance_dir,
+                )
+            )
+
+        result_rows = [
+            result.to_dict()
+            for result in execute_runtime_contexts(
+                runtime_backend,
+                contexts,
+                concurrency=benchmark_config.concurrency,
+            )
+        ]
+        for row in result_rows:
+            benchmark_id = str(row.get("benchmark_id") or "")
+            run_id = benchmark_to_run_id.get(benchmark_id)
+            if run_id is not None:
+                metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                metadata["batch_run_id"] = run_id
+                row["metadata"] = metadata
+            _append_jsonl_row(output_json, row)
+
+        from .eval_infer import summarize_results
+
+        evaluation_summary = summarize_results(result_rows)
+        _write_json(eval_output_file, evaluation_summary)
+
+    print(
+        json.dumps(
+            {
+                "agent_name": args.agent_name,
+                "model": resolved_primary.llm_config.get("model"),
+                "batch_id": batch_id,
+                "task_count": len(batch_tasks),
+                "runtime_backend": runtime_backend.name,
+                "execution_mode": "backend-execution" if benchmark_config.execute else "scaffold-only",
+                "concurrency": benchmark_config.concurrency,
+                "outputs": {
+                    "manifest": str(manifest_output_file),
+                    "image_plan": str(image_plan_output_file),
+                    "run_plan": str(run_plan_path),
+                    "output_json": str(output_json),
+                    "evaluation_summary": str(eval_output_file) if evaluation_summary is not None else None,
+                },
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

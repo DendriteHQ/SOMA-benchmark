@@ -784,6 +784,16 @@ def _resolve_run_id_header_value(context: RuntimeExecutionContext) -> str:
     return ""
 
 
+def _resolve_batch_id_header_value(context: RuntimeExecutionContext) -> str:
+    for value in (
+        _resolve_runtime_option(context, "openclaw_batch_id_header_value"),
+        os.getenv("SOMA_OPENCLAW_BATCH_ID_HEADER_VALUE"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _is_openrouter_context(context: RuntimeExecutionContext) -> bool:
     model = str(context.llm_config.get("model", "")).strip()
     base_url = str(context.llm_config.get("base_url", "")).strip()
@@ -2880,8 +2890,14 @@ def _build_provider_config(context: RuntimeExecutionContext) -> dict[str, Any]:
         elif use_openai_proxy_without_api_key:
             openai_provider["apiKey"] = "sk-local-proxy-placeholder"
         run_id_header_value = _resolve_run_id_header_value(context)
-        if run_id_header_value:
-            openai_provider["headers"] = {"X-Run-Id": run_id_header_value}
+        batch_id_header_value = _resolve_batch_id_header_value(context)
+        provider_headers: dict[str, str] = {}
+        if batch_id_header_value:
+            provider_headers["X-Batch-Id"] = batch_id_header_value
+        elif run_id_header_value:
+            provider_headers["X-Run-Id"] = run_id_header_value
+        if provider_headers:
+            openai_provider["headers"] = provider_headers
         _provider_timeout_raw = os.getenv(OPENCLAW_PROVIDER_TIMEOUT_SECONDS_ENV)
         try:
             _provider_timeout_val = int(_provider_timeout_raw) if _provider_timeout_raw is not None else OPENCLAW_DEFAULT_PROVIDER_TIMEOUT_SECONDS

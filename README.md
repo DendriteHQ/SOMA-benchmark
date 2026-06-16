@@ -23,10 +23,14 @@ cp .env.example .env
 
 Edit `.env` with your LLM settings. For example:
 
+
+For standalone OpenRouter runs with OpenClaw and SWE-bench evaluation, set:
+
 ```bash
-LLM_API_KEY=...
-LLM_BASE_URL=...
-LLM_MODEL=...
+LLM_MODEL=openrouter/qwen/qwen3-coder
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+COMPACT_BENCH_PLUGIN_TEMPLATE_PATH=/path/to/plugin/SOMA-plugin
+OPENROUTER_API_KEY=...
 ```
 
 Optional OpenClaw plugin settings:
@@ -40,15 +44,20 @@ SOMA_OPENCLAW_PLUGIN_REINSTALL_ON_RUN_START=true
 
 Run one benchmark instance directly from its problem statement:
 
+
+Standalone example:
+
 ```bash
-uv run python -m soma_bench benchmark-solve \
+source .env && uv run python -m soma_bench benchmark-solve \
   --agent-name openclaw \
   --benchmark SWE-bench/SWE-bench_Verified \
   --instance-id INSTANCE_ID \
   --execute \
   --openclaw-plugin-path /path/to/plugin/SOMA-plugin \
+  --openclaw-current-user \
   --openclaw-plugin-reinstall-on-run-start \
-  --openclaw-command "--timeout 180"
+  --openclaw-command "--timeout 3000"
+  --swerebench-eval
 ```
 
 Run OpenClaw against an existing benchmark manifest:

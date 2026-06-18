@@ -1,15 +1,15 @@
 # SOMA Bench
 
-SOMA Bench runs SWE-bench style tasks through OpenClaw and records runtime artifacts, patch output, token usage, and optional SWE-bench evaluation results.
+SOMA Bench runs SWE-bench style tasks through runtime backends (OpenClaw and Copilot) and records runtime artifacts, patch output, token usage, and optional SWE-bench evaluation results.
 
-The current runtime backend is OpenClaw. It can load the SOMA OpenClaw plugin as a context-engine plugin, so benchmark runs can exercise the local SOMA miner during normal OpenClaw execution.
+The OpenClaw backend can load the SOMA OpenClaw plugin as a context-engine plugin, so benchmark runs can exercise the local SOMA miner during normal OpenClaw execution.
 
 ## Run OpenClaw
 
 Expected local layout:
 
 ```text
-~/SOMA-benchmark
+docker compose -f src/soma_bench/benchmark/backends/copilot/copilot-cli-container/docker-compose.yml run --rm copilot \
 ~/SOMA-plugin
 ```
 
@@ -17,7 +17,7 @@ Prepare the benchmark repo:
 
 ```bash
 cd ~/SOMA-benchmark
-uv sync
+SOMA_COPILOT_COMPOSE_FILE=src/soma_bench/benchmark/backends/copilot/copilot-cli-container/docker-compose.yml
 cp .env.example .env
 ```
 
@@ -82,3 +82,30 @@ To disable the OpenClaw plugin for a comparison run, add:
 ```bash
 --openclaw-disable-plugin
 ```
+
+## Run Copilot
+
+Run Copilot against an existing benchmark manifest:
+
+Without compression:
+
+```bash
+uv run python -m soma_bench benchmark-solve \
+  --agent-name copilot \
+  --benchmark SWE-bench/SWE-bench_Verified \
+  --instance-id INSTANCE_ID \
+  --execute \
+  --output-dir outputs/run-copilot-no-compression
+  ```
+
+With compression:
+
+```bash
+uv run python -m soma_bench benchmark-solve \
+  --agent-name copilot \
+  --benchmark SWE-bench/SWE-bench_Verified \
+  --instance-id INSTANCE_ID \
+  --execute \
+  --copilot-compression-service-autobuild \
+  --copilot-compression-script-path /absolute/path/to/your_miner.py \
+  --output-dir outputs/run-copilot-with-compression

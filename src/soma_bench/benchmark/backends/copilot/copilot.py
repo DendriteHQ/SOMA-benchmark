@@ -8,6 +8,7 @@ import subprocess
 import hashlib
 import tempfile
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -345,6 +346,31 @@ def _resolve_proxy_port(context: RuntimeExecutionContext, *, proxy_service: str)
     return COPILOT_DEFAULT_PROXY_PORT
 
 
+def _normalize_run_id(value: str) -> str:
+    sanitized = "".join(char for char in value if char.isalnum() or char in {"-", "_"})
+    return sanitized[:40]
+
+
+def _resolve_execution_run_id(context: RuntimeExecutionContext) -> str:
+    for value in (
+        _resolve_runtime_option(context, "copilot_run_id"),
+        os.getenv("SOMA_COPILOT_RUN_ID"),
+    ):
+        if isinstance(value, str) and value.strip():
+            normalized = _normalize_run_id(value.strip())
+            if normalized:
+                context.run_payload["_copilot_resolved_run_id"] = normalized
+                return normalized
+
+    cached = context.run_payload.get("_copilot_resolved_run_id")
+    if isinstance(cached, str) and cached.strip():
+        return cached.strip()
+
+    generated = uuid.uuid4().hex[:12]
+    context.run_payload["_copilot_resolved_run_id"] = generated
+    return generated
+
+
 def _resolve_compose_project_name(context: RuntimeExecutionContext) -> str:
     for value in (
         _resolve_runtime_option(context, "copilot_compose_project"),
@@ -352,9 +378,11 @@ def _resolve_compose_project_name(context: RuntimeExecutionContext) -> str:
     ):
         if isinstance(value, str) and value.strip():
             return value.strip()
+
+    run_id = _resolve_execution_run_id(context)
     benchmark_key = str(context.instance.benchmark_id or context.instance.instance_id or "instance")
     digest = hashlib.sha256(
-        f"{context.output_dir.resolve()}::{benchmark_key}".encode("utf-8")
+        f"{context.output_dir.resolve()}::{benchmark_key}::{run_id}".encode("utf-8")
     ).hexdigest()[:10]
     return f"soma-copilot-{digest}"
 
@@ -463,8 +491,8 @@ def _resolve_run_root(context: RuntimeExecutionContext) -> Path:
     else:
         base_root = (Path(tempfile.gettempdir()) / COPILOT_DEFAULT_RUN_ROOT_DIRNAME).resolve()
 
-    run_digest = hashlib.sha256(str(context.output_dir.resolve()).encode("utf-8")).hexdigest()[:12]
-    return base_root / f"run-{run_digest}"
+    run_id = _resolve_execution_run_id(context)
+    return base_root / f"run-{run_id}"
 
 
 def _resolve_instance_run_root(context: RuntimeExecutionContext, *, run_root: Path) -> Path:
@@ -1087,6 +1115,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "stack_up_stderr": stack_up_stderr,
         "stack_down_stdout": stack_down_stdout,
         "stack_down_stderr": stack_down_stderr,
+        "run_id": _resolve_execution_run_id(context),
         "compression_enabled": compression_enabled,
         "compression_script_path": str(compression_script_path) if compression_script_path is not None else "",
         "compression_service_image": compression_image,

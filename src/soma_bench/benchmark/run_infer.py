@@ -37,6 +37,9 @@ def _build_runtime_options(
     swerebench_cache_level: str | None,
     swerebench_timeout: int | None,
     swerebench_max_workers: int | None,
+    copilot_compression_script_path: str | None,
+    copilot_compression_service_autobuild: bool,
+    copilot_compression_service_build_context: str | None,
 ) -> dict[str, Any]:
     runtime_options: dict[str, Any] = {}
     if openclaw_command:
@@ -71,6 +74,25 @@ def _build_runtime_options(
         runtime_options["swerebench_timeout"] = swerebench_timeout
     if swerebench_max_workers is not None:
         runtime_options["swerebench_max_workers"] = swerebench_max_workers
+
+    compression_mode_requested = any(
+        [
+            bool(copilot_compression_script_path),
+            bool(copilot_compression_service_autobuild),
+            bool(copilot_compression_service_build_context),
+        ]
+    )
+    if compression_mode_requested:
+        runtime_options["copilot_proxy_service"] = "compression-service"
+
+    if copilot_compression_script_path:
+        runtime_options["copilot_compression_script_path"] = copilot_compression_script_path
+    if copilot_compression_service_autobuild:
+        runtime_options["copilot_compression_service_autobuild"] = True
+    if copilot_compression_service_build_context:
+        runtime_options["copilot_compression_service_build_context"] = (
+            copilot_compression_service_build_context
+        )
     return runtime_options
 
 
@@ -203,6 +225,30 @@ def main(argv: list[str] | None = None) -> int:
         help="Recreate the SOMA plugin Python environment once at the start of this benchmark process.",
     )
     parser.add_argument(
+        "--copilot-compression-script-path",
+        default=None,
+        help=(
+            "Optional path to compressor script mounted into compression-service as /app/miner/base_miner.py. "
+            "If omitted, backend falls back to src/compression_service/app/base_miner.py."
+        ),
+    )
+    parser.add_argument(
+        "--copilot-compression-service-autobuild",
+        action="store_true",
+        help=(
+            "Build compression-service image before each Copilot run when compression-service is enabled. "
+            "Uses src/compression_service by default."
+        ),
+    )
+    parser.add_argument(
+        "--copilot-compression-service-build-context",
+        default=None,
+        help=(
+            "Optional docker build context for compression-service autobuild. "
+            "Defaults to src/compression_service."
+        ),
+    )
+    parser.add_argument(
         "--swerebench-eval",
         action="store_true",
         help="After agent execution, export the resulting patch and run SWE-rebench evaluation through swebench.harness.",
@@ -272,6 +318,9 @@ def main(argv: list[str] | None = None) -> int:
         swerebench_cache_level=args.swerebench_cache_level,
         swerebench_timeout=args.swerebench_timeout,
         swerebench_max_workers=args.swerebench_max_workers,
+        copilot_compression_script_path=args.copilot_compression_script_path,
+        copilot_compression_service_autobuild=args.copilot_compression_service_autobuild,
+        copilot_compression_service_build_context=args.copilot_compression_service_build_context,
     )
     run_plan = build_run_plan(
         instances,

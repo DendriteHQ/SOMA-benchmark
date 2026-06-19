@@ -50,6 +50,7 @@ def _build_runtime_options(
         runtime_options["openclaw_user"] = "current"
     if openclaw_run_id_header_value:
         runtime_options["openclaw_run_id_header_value"] = openclaw_run_id_header_value
+        runtime_options["copilot_run_id_header_value"] = openclaw_run_id_header_value
     if openclaw_ignore_api_key:
         runtime_options["openclaw_ignore_api_key"] = True
     if openclaw_plugin_path:
@@ -74,16 +75,6 @@ def _build_runtime_options(
         runtime_options["swerebench_timeout"] = swerebench_timeout
     if swerebench_max_workers is not None:
         runtime_options["swerebench_max_workers"] = swerebench_max_workers
-
-    compression_mode_requested = any(
-        [
-            bool(copilot_compression_script_path),
-            bool(copilot_compression_service_autobuild),
-            bool(copilot_compression_service_build_context),
-        ]
-    )
-    if compression_mode_requested:
-        runtime_options["copilot_proxy_service"] = "compression-service"
 
     if copilot_compression_script_path:
         runtime_options["copilot_compression_script_path"] = copilot_compression_script_path

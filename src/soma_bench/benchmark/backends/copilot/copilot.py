@@ -44,6 +44,8 @@ COPILOT_DEFAULT_OUTPUT_FORMAT = "json"
 COPILOT_DEFAULT_RUN_ROOT_DIRNAME = "soma-benchmark-copilot-runs"
 COPILOT_DEFAULT_CLEANUP_REPO = True
 COPILOT_DEFAULT_COMPRESSION_AUTOBUILD = False
+COPILOT_DEFAULT_SHARED_PROXY_BATCH = True
+COPILOT_DEFAULT_SHARED_PROXY_TEARDOWN = True
 
 
 def _resolve_runtime_options(context: RuntimeExecutionContext) -> dict[str, Any]:
@@ -188,6 +190,17 @@ def _resolve_compression_service_autobuild(context: RuntimeExecutionContext) -> 
     return COPILOT_DEFAULT_COMPRESSION_AUTOBUILD
 
 
+def _resolve_use_compose_compression_service(context: RuntimeExecutionContext) -> bool:
+    for value in (
+        _resolve_runtime_option(context, "copilot_use_compose_compression_service"),
+        os.getenv("SOMA_COPILOT_USE_COMPOSE_COMPRESSION_SERVICE"),
+    ):
+        option = _coerce_bool_option(value)
+        if option is not None:
+            return option
+    return False
+
+
 def _resolve_compression_service_build_context(context: RuntimeExecutionContext) -> Path:
     default_path = Path(__file__).resolve().parents[5] / "src" / "compression_service"
     for value in (
@@ -251,12 +264,16 @@ def _build_compression_service_image(
     return (build_result.stdout or "", build_result.stderr or "")
 
 
-def _resolve_stack_services(context: RuntimeExecutionContext, *, proxy_service: str) -> list[str]:
-    # If Copilot is pointed at a middleware sidecar (for example compression-service),
-    # keep proxy running too so middleware can forward to a controlled egress path.
+def _resolve_stack_services(
+    context: RuntimeExecutionContext,
+    *,
+    proxy_service: str,
+    compression_enabled: bool,
+) -> list[str]:
+    # Custom proxy is the only egress-facing entrypoint for Copilot traffic.
     services = [proxy_service]
-    if proxy_service != COPILOT_DEFAULT_PROXY_SERVICE:
-        services.append(COPILOT_DEFAULT_PROXY_SERVICE)
+    if compression_enabled:
+        services.append(COPILOT_COMPRESSION_SERVICE_NAME)
     return services
 
 
@@ -346,6 +363,16 @@ def _resolve_proxy_port(context: RuntimeExecutionContext, *, proxy_service: str)
     return COPILOT_DEFAULT_PROXY_PORT
 
 
+def _resolve_copilot_run_id_header_value(context: RuntimeExecutionContext) -> str:
+    for value in (
+        _resolve_runtime_option(context, "copilot_run_id_header_value"),
+        os.getenv("SOMA_COPILOT_RUN_ID_HEADER_VALUE"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _normalize_run_id(value: str) -> str:
     sanitized = "".join(char for char in value if char.isalnum() or char in {"-", "_"})
     return sanitized[:40]
@@ -380,11 +407,85 @@ def _resolve_compose_project_name(context: RuntimeExecutionContext) -> str:
             return value.strip()
 
     run_id = _resolve_execution_run_id(context)
-    benchmark_key = str(context.instance.benchmark_id or context.instance.instance_id or "instance")
     digest = hashlib.sha256(
-        f"{context.output_dir.resolve()}::{benchmark_key}::{run_id}".encode("utf-8")
+        f"{context.output_dir.resolve()}::{run_id}".encode("utf-8")
     ).hexdigest()[:10]
     return f"soma-copilot-{digest}"
+
+
+def _resolve_shared_proxy_batch_enabled(context: RuntimeExecutionContext) -> bool:
+    for value in (
+        _resolve_runtime_option(context, "copilot_shared_proxy"),
+        os.getenv("SOMA_COPILOT_SHARED_PROXY"),
+    ):
+        option = _coerce_bool_option(value)
+        if option is not None:
+            return option
+    return COPILOT_DEFAULT_SHARED_PROXY_BATCH
+
+
+def _resolve_shared_proxy_teardown_enabled(context: RuntimeExecutionContext) -> bool:
+    for value in (
+        _resolve_runtime_option(context, "copilot_shared_proxy_teardown"),
+        os.getenv("SOMA_COPILOT_SHARED_PROXY_TEARDOWN"),
+    ):
+        option = _coerce_bool_option(value)
+        if option is not None:
+            return option
+    return COPILOT_DEFAULT_SHARED_PROXY_TEARDOWN
+
+
+def _with_runtime_option_overrides(
+    context: RuntimeExecutionContext,
+    overrides: dict[str, Any],
+) -> RuntimeExecutionContext:
+    run_payload = dict(context.run_payload)
+    runtime_options = dict(_resolve_runtime_options(context))
+    runtime_options.update(overrides)
+    run_payload["runtime_options"] = runtime_options
+    return RuntimeExecutionContext(
+        backend_name=context.backend_name,
+        instance=context.instance,
+        run_payload=run_payload,
+        llm_config=context.llm_config,
+        workspace=context.workspace,
+        max_iterations=context.max_iterations,
+        output_dir=context.output_dir,
+        instance_dir=context.instance_dir,
+    )
+
+
+def _teardown_shared_compose_stack(context: RuntimeExecutionContext, *, compose_project: str) -> None:
+    compose_file = _resolve_compose_file(context)
+    env = os.environ.copy()
+    existing_profiles = str(env.get("COMPOSE_PROFILES", "")).strip()
+    if existing_profiles:
+        profiles = {item.strip() for item in existing_profiles.split(",") if item.strip()}
+        profiles.add("copilot-sidecars")
+        env["COMPOSE_PROFILES"] = ",".join(sorted(profiles))
+    else:
+        env["COMPOSE_PROFILES"] = "copilot-sidecars"
+
+    down_result = _run_command(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(compose_file),
+            "--project-name",
+            compose_project,
+            "down",
+            "--remove-orphans",
+            "--volumes",
+        ],
+        env=env,
+    )
+    if down_result.returncode != 0:
+        emit_progress(
+            "[copilot] failed to tear down shared compose stack: "
+            f"{(down_result.stderr or down_result.stdout or '').strip()}",
+            component="copilot",
+        )
 
 
 def _normalize_proxy_upstream_base_url(value: str) -> str:
@@ -838,7 +939,8 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     swe_sandbox_service = _resolve_swe_sandbox_service(context)
     swe_sandbox_repo_path = _resolve_swe_sandbox_repo_path(context)
     swe_sandbox_image = _resolve_swe_sandbox_image(context)
-    compression_enabled = proxy_service == COPILOT_COMPRESSION_SERVICE_NAME
+    compression_enabled = True
+    use_compose_compression_service = _resolve_use_compose_compression_service(context)
     compression_image = _resolve_compression_service_image(context)
     compression_autobuild = _resolve_compression_service_autobuild(context)
     compression_script_path: Path | None = None
@@ -848,7 +950,11 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         if compression_autobuild:
             compression_build_context = _resolve_compression_service_build_context(context)
 
-    stack_services = _resolve_stack_services(context, proxy_service=proxy_service)
+    stack_services = _resolve_stack_services(
+        context,
+        proxy_service=proxy_service,
+        compression_enabled=use_compose_compression_service,
+    )
     if swe_sandbox_enabled and swe_sandbox_image:
         stack_services.append(swe_sandbox_service)
     prompt = _build_prompt(context)
@@ -901,6 +1007,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
 
     env = os.environ.copy()
     env["COPILOT_COMPRESSION_SERVICE_IMAGE"] = compression_image
+    env["COPILOT_PROXY_IMAGE"] = compression_image
     if compression_script_path is not None:
         env["COPILOT_COMPRESSION_SCRIPT_PATH"] = str(compression_script_path)
         env["MINER_MODULE_PATH"] = COPILOT_DEFAULT_COMPRESSION_SCRIPT_CONTAINER_PATH
@@ -939,16 +1046,23 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 "Set LLM_BASE_URL (or OPENAI_BASE_URL / OPENROUTER_BASE_URL)."
             )
         env[COPILOT_PROXY_UPSTREAM_ENV] = _normalize_proxy_upstream_base_url(base_url_raw)
-        # Forward both names so different compression-service builds can discover proxy upstream.
-        env["COMPRESSION_UPSTREAM_BASE_URL"] = f"http://{COPILOT_DEFAULT_PROXY_SERVICE}:{COPILOT_DEFAULT_PROXY_PORT}/"
-        env["SOMA_COMPRESSION_SERVICE_UPSTREAM_BASE_URL"] = env["COMPRESSION_UPSTREAM_BASE_URL"]
+        env["PROXY_COMPRESSION_ENABLED"] = "true" if compression_enabled else "false"
+        env["PROXY_COMPRESSION_BASE_URL"] = (
+            f"http://{COPILOT_COMPRESSION_SERVICE_NAME}:{COPILOT_COMPRESSION_SERVICE_PORT}/"
+        )
         env["COPILOT_PROVIDER_BASE_URL"] = f"http://{proxy_service}:{proxy_port}/"
     elif isinstance(context.llm_config.get("base_url"), str):
         env["COPILOT_PROVIDER_BASE_URL"] = str(context.llm_config["base_url"])
     if isinstance(context.llm_config.get("model"), str):
         env["COPILOT_MODEL"] = str(context.llm_config["model"])
-    if isinstance(context.llm_config.get("api_key"), str):
+    run_id_header_value = _resolve_copilot_run_id_header_value(context)
+    if run_id_header_value:
+        # For gateway mode, provider-facing auth is replaced with run_id and resolved server-side.
+        # Keep this on Copilot run container only; avoid mutating shared proxy container env per run.
+        env["COPILOT_PROVIDER_API_KEY"] = run_id_header_value
+    elif isinstance(context.llm_config.get("api_key"), str):
         env["COPILOT_PROVIDER_API_KEY"] = str(context.llm_config["api_key"])
+        env["PROXY_PROVIDER_API_KEY"] = str(context.llm_config["api_key"])
 
     stack_up_stdout = ""
     stack_up_stderr = ""
@@ -1159,20 +1273,54 @@ def run_copilot_batch(
     if not contexts:
         return []
 
+    shared_proxy_enabled = _resolve_shared_proxy_batch_enabled(contexts[0])
+    shared_proxy_teardown_enabled = _resolve_shared_proxy_teardown_enabled(contexts[0])
+    if shared_proxy_enabled:
+        run_id = _resolve_execution_run_id(contexts[0])
+        digest = hashlib.sha256(
+            f"{contexts[0].output_dir.resolve()}::{run_id}".encode("utf-8")
+        ).hexdigest()[:10]
+        shared_compose_project = f"soma-copilot-{digest}"
+        contexts = [
+            _with_runtime_option_overrides(
+                context,
+                {
+                    "copilot_compose_project": shared_compose_project,
+                    "copilot_keep_stack": True,
+                },
+            )
+            for context in contexts
+        ]
+        if concurrency > 1:
+            emit_progress(
+                "[copilot] shared proxy mode requires serial execution; forcing concurrency=1 "
+                "to avoid workspace volume races.",
+                component="copilot",
+            )
+            concurrency = 1
+
     worker_count = max(1, min(concurrency, len(contexts)))
-    if worker_count == 1:
-        return [run_copilot_instance(context) for context in contexts]
+    try:
+        if worker_count == 1:
+            return [run_copilot_instance(context) for context in contexts]
 
-    results: list[RuntimeExecutionResult | None] = [None] * len(contexts)
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_to_index = {
-            executor.submit(run_copilot_instance, context): index
-            for index, context in enumerate(contexts)
-        }
-        for future in as_completed(future_to_index):
-            results[future_to_index[future]] = future.result()
+        results: list[RuntimeExecutionResult | None] = [None] * len(contexts)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_index = {
+                executor.submit(run_copilot_instance, context): index
+                for index, context in enumerate(contexts)
+            }
+            for future in as_completed(future_to_index):
+                results[future_to_index[future]] = future.result()
 
-    return [result for result in results if result is not None]
+        return [result for result in results if result is not None]
+    finally:
+        if shared_proxy_enabled and shared_proxy_teardown_enabled and contexts:
+            compose_project = str(
+                _resolve_runtime_option(contexts[0], "copilot_compose_project")
+                or _resolve_compose_project_name(contexts[0])
+            )
+            _teardown_shared_compose_stack(contexts[0], compose_project=compose_project)
 
 
 COPILOT_BACKEND = RuntimeBackend(

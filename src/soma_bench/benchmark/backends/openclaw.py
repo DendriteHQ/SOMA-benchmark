@@ -29,7 +29,7 @@ OPENCLAW_WORKSPACE_ERROR = (
     "Received workspace={workspace!r}."
 )
 
-OPENCLAW_GATEWAY_IMAGE = "alpine/openclaw:latest"
+OPENCLAW_GATEWAY_IMAGE = "alpine/openclaw:2026.6.1-alpha.1"
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_GATEWAY_START_RETRIES = 20
 OPENCLAW_GATEWAY_START_SLEEP_SECONDS = 0.5
@@ -1476,9 +1476,9 @@ def _resolve_compression_service_context_dir() -> Path | None:
         return path if path.is_dir() else None
     # Relative to well-known repo locations
     candidates = [
-        Path(__file__).resolve().parents[4] / "SOMA-miner-fastapi" / "sandbox_service" / "compression_service",
-        Path(__file__).resolve().parents[5] / "SOMA-miner-fastapi" / "sandbox_service" / "compression_service",
-        Path.home() / "SOMA-miner-fastapi" / "sandbox_service" / "compression_service",
+        Path(__file__).resolve().parents[4] / "SOMA" / "sandbox_service" / "compression_service",
+        Path(__file__).resolve().parents[5] / "SOMA" / "sandbox_service" / "compression_service",
+        Path.home() / "SOMA" / "sandbox_service" / "compression_service",
     ]
     for candidate in candidates:
         if candidate.is_dir():
@@ -1500,7 +1500,7 @@ def _build_compression_service_image_on_host() -> None:
     if context_dir is None:
         raise RuntimeError(
             "Compression service build context not found. "
-            "Set COMPACT_BENCH_COMPRESSION_SERVICE_CONTEXT or ensure SOMA-miner-fastapi is reachable."
+            "Set COMPACT_BENCH_COMPRESSION_SERVICE_CONTEXT or ensure SOMA/sandbox_service is reachable."
         )
     result = _run_command(["docker", "build", "-t", image_name, str(context_dir)])
     if result.returncode != 0:
@@ -1695,6 +1695,23 @@ def _ensure_compression_service(context: RuntimeExecutionContext) -> str | None:
         component="openclaw",
     )
     return service_url
+
+
+def _ensure_compression_service_image_built_for_run_start(context: RuntimeExecutionContext) -> None:
+    if not _resolve_compression_service_enabled(context):
+        return
+    plugin_path = _resolve_plugin_path(context)
+    if plugin_path is None:
+        return
+    miner_script = plugin_path / PLUGIN_ENTRYPOINT
+    if not miner_script.is_file():
+        return
+
+    emit_progress(
+        f"ensuring compression service image is built on host",
+        component="openclaw",
+    )
+    _build_compression_service_image_on_host()
 
 
 def _teardown_compression_service(context: RuntimeExecutionContext) -> None:
@@ -3697,6 +3714,8 @@ def run_openclaw_instance(context: RuntimeExecutionContext) -> RuntimeExecutionR
     if context.workspace != "docker":
         raise RuntimeError(OPENCLAW_WORKSPACE_ERROR.format(workspace=context.workspace))
 
+    _ensure_compression_service_image_built_for_run_start(context)
+
     keep_gateway = _resolve_keep_gateway_enabled(context)
     keep_workspace = _resolve_keep_workspace_enabled(context)
     _prepare_openclaw_context(context)
@@ -3744,6 +3763,7 @@ def run_openclaw_batch(
 ) -> list[RuntimeExecutionResult]:
     _validate_batch_contexts(contexts)
     primary = contexts[0]
+    _ensure_compression_service_image_built_for_run_start(primary)
     keep_gateway = _resolve_keep_gateway_enabled(primary)
     keep_workspace = _resolve_keep_workspace_enabled(primary)
     gateway_name = _resolve_gateway_name(primary)

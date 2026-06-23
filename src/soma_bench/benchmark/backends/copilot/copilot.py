@@ -1297,6 +1297,8 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             )
             stack_down_stdout = stack_down.stdout or ""
             stack_down_stderr = stack_down.stderr or ""
+            for _net_suffix in ("copilot-sandbox", "copilot-egress"):
+                _run_command(["docker", "network", "rm", f"{compose_project}_{_net_suffix}"])
 
     if not keep_stack:
         _remove_workspace_volume(volume_name=workspace_volume)

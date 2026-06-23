@@ -42,7 +42,7 @@ _token_totals: dict[str, int] = {
 TOKEN_USAGE_LOG_MARKER = "[proxy][token-usage] "
 
 
-def _extract_usage_from_response(response_body: bytes) -> dict[str, int] | None:
+def _extract_usage_from_response(response_body: bytes) -> dict | None:
     try:
         data = json.loads(response_body)
     except (json.JSONDecodeError, ValueError):
@@ -52,19 +52,34 @@ def _extract_usage_from_response(response_body: bytes) -> dict[str, int] | None:
     usage = data.get("usage")
     if not isinstance(usage, dict):
         return None
-    result: dict[str, int] = {}
-    for key, val in usage.items():
-        if isinstance(val, int) and val >= 0:
-            result[key] = val
-    return result or None
+    return usage
 
 
-async def _accumulate_token_usage(usage: dict[str, int]) -> None:
+async def _accumulate_token_usage(usage: dict) -> None:
+    prompt_details = usage.get("prompt_tokens_details")
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+
+    # Anthropic format: input_tokens = non-cached only, cache_read_input_tokens = cached
+    # OpenAI/Qwen format: prompt_tokens = total (includes cached), cached_tokens = subset
+    # Normalize to Anthropic semantics so total = input + cached + output (no double-count)
+    if "input_tokens" in usage:
+        raw_input = usage["input_tokens"]
+        cache_read = usage.get("cache_read_input_tokens", 0)
+        cache_write = usage.get("cache_creation_input_tokens", 0)
+    else:
+        raw_prompt = usage.get("prompt_tokens") or 0
+        cache_read = prompt_details.get("cached_tokens") or 0
+        cache_write = prompt_details.get("cache_write_tokens") or 0
+        raw_input = raw_prompt - cache_read  # non-cached portion only
+
     async with _token_lock:
-        _token_totals["input_tokens"] += usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
-        _token_totals["output_tokens"] += usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
-        _token_totals["cache_read_tokens"] += usage.get("cache_read_input_tokens", 0)
-        _token_totals["cache_creation_tokens"] += usage.get("cache_creation_input_tokens", 0)
+        _token_totals["input_tokens"] += max(raw_input, 0)
+        _token_totals["output_tokens"] += (
+            usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        )
+        _token_totals["cache_read_tokens"] += cache_read
+        _token_totals["cache_creation_tokens"] += cache_write
         snapshot = dict(_token_totals)
     print(f"{TOKEN_USAGE_LOG_MARKER}{json.dumps(snapshot)}", flush=True)
 

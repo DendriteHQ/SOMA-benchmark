@@ -824,6 +824,30 @@ def _collect_compose_service_logs(
     return log_paths
 
 
+_PROXY_TOKEN_USAGE_MARKER = "[proxy][token-usage] "
+
+
+def _extract_proxy_token_usage(*, sidecar_log_paths: dict[str, str]) -> dict[str, int]:
+    proxy_log_path = sidecar_log_paths.get("proxy_log", "")
+    if not proxy_log_path:
+        return {}
+    log_file = Path(proxy_log_path)
+    if not log_file.is_file():
+        return {}
+    last_usage: dict[str, int] = {}
+    for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        idx = line.find(_PROXY_TOKEN_USAGE_MARKER)
+        if idx == -1:
+            continue
+        try:
+            parsed = json.loads(line[idx + len(_PROXY_TOKEN_USAGE_MARKER):])
+            if isinstance(parsed, dict):
+                last_usage = {k: v for k, v in parsed.items() if isinstance(v, int)}
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return last_usage
+
+
 def _extract_message_request_logs(*, sidecar_log_paths: dict[str, str], destination_dir: Path) -> dict[str, str]:
     in_marker = "[compression-service][messages.in] "
     out_marker = "[compression-service][messages.out] "
@@ -1133,6 +1157,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     swe_sandbox_container_name = ""
     sidecar_log_paths: dict[str, str] = {}
     message_request_log_paths: dict[str, str] = {}
+    proxy_token_usage: dict[str, int] = {}
     patch_capture: dict[str, Any] = {
         "status": "not-captured",
         "repo_dir": "",
@@ -1263,6 +1288,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 sidecar_log_paths=sidecar_log_paths,
                 destination_dir=tmp_run_dir,
             )
+            proxy_token_usage = _extract_proxy_token_usage(sidecar_log_paths=sidecar_log_paths)
         if stack_up_attempted and not keep_stack:
             stack_down = _run_command(
                 [*compose_prefix, "down", "--remove-orphans", "--volumes"],
@@ -1330,6 +1356,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "trajectory_path": str(trajectory_path) if trajectory_path is not None else "",
         "stream_log_path": str((tmp_run_dir / "copilot-stream.log").resolve()),
         "patch_capture": patch_capture,
+        "token_usage": proxy_token_usage,
         **sidecar_log_paths,
         **message_request_log_paths,
         **log_paths,

@@ -66,6 +66,8 @@ services:
 volumes:
   copilot-home:
   copilot-workspace:
+    external: true
+    name: ${COPILOT_WORKSPACE_VOLUME_NAME}
 
 networks:
   copilot-sandbox:

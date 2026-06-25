@@ -14,7 +14,7 @@ from .execution import execute_runtime_contexts
 from .manifest import load_manifest, write_jsonl
 from .progress import emit_progress
 from .run_infer import _build_runtime_options, build_run_plan
-from .runner_settings import resolve_benchmark_concurrency, resolve_runner_config
+from .runner_settings import resolve_benchmark_concurrency, resolve_benchmark_runtime_setup, resolve_runner_config
 from .swebench_images import enrich_hidden_eval_with_runtime_image
 
 
@@ -39,6 +39,7 @@ BENCHMARK_TYPES = (
     BENCHMARK_TYPE_SWE_EXPLORER_EDIT,
 )
 
+_SWE_EXPLORER_BENCHMARK_NAME = "SWE-Explore-Bench/SWE-Explore-Bench"
 _SWE_EXPLORER_EXPLORE_TOP_K = 20
 
 _SWE_EXPLORER_EXPLORE_TEMPLATE = """\
@@ -49,11 +50,13 @@ following issue. Do NOT make any code changes.
 Use Glob, Grep, and Read tools to explore the codebase. Focus on finding
 the ROOT CAUSE, not just symptom locations.
 
-After exploration, output your findings in EXACTLY this format:
+After exploration, output your findings as a JSON array in EXACTLY this format
+and nothing else after it:
 
-RELEVANT_FILES:
-- path/to/file1.py:10-50
-- path/to/file2.py:1-100
+[
+  {{"path": "path/to/file1.py", "start": 10, "end": 50}},
+  {{"path": "path/to/file2.py", "start": 1, "end": 100}}
+]
 
 Focus on the root cause. Limit to top {top_k} most relevant regions.
 
@@ -125,6 +128,23 @@ def _build_problem_statement(
     benchmark_name = str(hidden_eval.get("benchmark", "benchmark")).strip() or "benchmark"
     instance_id = str(runtime_setup_entry.get("instance_id", "")).strip() or "unknown-instance"
     return f"Solve benchmark instance {instance_id} from {benchmark_name}."
+
+
+def _inject_swe_explorer_ground_truth(runtime_setup_entry: dict[str, Any], instance_id: str) -> None:
+    """Fetch ground_truth from SWE-Explorer dataset and inject into hidden_eval for swe_explorer_edit."""
+    try:
+        _, _, explorer_entry = resolve_benchmark_runtime_setup(
+            benchmark_name=_SWE_EXPLORER_BENCHMARK_NAME,
+            selection_id=instance_id,
+        )
+        ground_truth = explorer_entry.get("hidden_eval", {}).get("ground_truth")
+        if ground_truth:
+            runtime_setup_entry.setdefault("hidden_eval", {})["ground_truth"] = ground_truth
+    except Exception as exc:
+        emit_progress(
+            f"Warning: could not fetch SWE-Explorer ground truth for {instance_id}: {exc}",
+            component="benchmark-solve",
+        )
 
 
 def build_direct_manifest_row(
@@ -403,6 +423,9 @@ def main(argv: list[str] | None = None) -> int:
         copilot_compression_service_autobuild=args.copilot_compression_service_autobuild,
         copilot_compression_service_build_context=args.copilot_compression_service_build_context,
     )
+
+    if args.benchmark_type == BENCHMARK_TYPE_SWE_EXPLORER_EDIT:
+        _inject_swe_explorer_ground_truth(benchmark_config.runtime_setup_entry, args.instance_id)
 
     manifest_row = build_direct_manifest_row(
         benchmark_name=benchmark_config.benchmark_name,

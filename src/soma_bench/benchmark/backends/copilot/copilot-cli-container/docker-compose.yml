@@ -11,6 +11,8 @@ services:
       - copilot-home:/home/copilot
     networks:
       - copilot-sandbox
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     stdin_open: true
     tty: true
 
@@ -64,6 +66,8 @@ services:
 volumes:
   copilot-home:
   copilot-workspace:
+    external: true
+    name: ${COPILOT_WORKSPACE_VOLUME_NAME}
 
 networks:
   copilot-sandbox:

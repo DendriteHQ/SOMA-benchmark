@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from ..base import RuntimeBackend, RuntimeExecutionContext, RuntimeExecutionResult
+from ...swerebench_eval import capture_repo_patch
 from ...progress import emit_progress
 
 COPILOT_WORKSPACE_ERROR = (
@@ -30,7 +31,7 @@ COPILOT_DEFAULT_PROXY_SERVICE = "proxy"
 COPILOT_DEFAULT_PROXY_PORT = 8080
 COPILOT_COMPRESSION_SERVICE_NAME = "compression-service"
 COPILOT_COMPRESSION_SERVICE_PORT = 8000
-COPILOT_DEFAULT_COMPRESSION_IMAGE = "soma-compression-service:latest"
+COPILOT_DEFAULT_COMPRESSION_IMAGE = "soma-copilot-compression-service:latest"
 COPILOT_DEFAULT_COMPRESSION_SCRIPT_CONTAINER_PATH = "/app/miner/base_miner.py"
 COPILOT_DEFAULT_SWE_SANDBOX_SERVICE = "swe-sandbox"
 COPILOT_DEFAULT_SWE_SANDBOX_REPO_PATH = "/testbed"
@@ -126,8 +127,8 @@ def _resolve_output_format(context: RuntimeExecutionContext) -> str:
 
 def _resolve_network_isolation_enabled(context: RuntimeExecutionContext) -> bool:
     for value in (
-        _resolve_runtime_option(context, "copilot_network_isolation"),
         os.getenv("SOMA_COPILOT_NETWORK_ISOLATION"),
+        _resolve_runtime_option(context, "copilot_network_isolation"),
     ):
         option = _coerce_bool_option(value)
         if option is not None:
@@ -137,8 +138,8 @@ def _resolve_network_isolation_enabled(context: RuntimeExecutionContext) -> bool
 
 def _resolve_keep_compose_stack(context: RuntimeExecutionContext) -> bool:
     for value in (
-        _resolve_runtime_option(context, "copilot_keep_stack"),
         os.getenv("SOMA_COPILOT_KEEP_STACK"),
+        _resolve_runtime_option(context, "copilot_keep_stack"),
     ):
         option = _coerce_bool_option(value)
         if option is not None:
@@ -148,8 +149,8 @@ def _resolve_keep_compose_stack(context: RuntimeExecutionContext) -> bool:
 
 def _resolve_cleanup_repo_enabled(context: RuntimeExecutionContext) -> bool:
     for value in (
-        _resolve_runtime_option(context, "copilot_cleanup_repo"),
         os.getenv("SOMA_COPILOT_CLEANUP_REPO"),
+        _resolve_runtime_option(context, "copilot_cleanup_repo"),
     ):
         option = _coerce_bool_option(value)
         if option is not None:
@@ -198,7 +199,7 @@ def _resolve_use_compose_compression_service(context: RuntimeExecutionContext) -
         option = _coerce_bool_option(value)
         if option is not None:
             return option
-    return False
+    return True
 
 
 def _resolve_compression_service_build_context(context: RuntimeExecutionContext) -> Path:
@@ -269,9 +270,12 @@ def _resolve_stack_services(
     *,
     proxy_service: str,
     compression_enabled: bool,
+    include_proxy: bool,
 ) -> list[str]:
-    # Custom proxy is the only egress-facing entrypoint for Copilot traffic.
-    services = [proxy_service]
+    services: list[str] = []
+    # In shared-proxy mode, run containers should not launch their own proxy sidecar.
+    if include_proxy:
+        services.append(proxy_service)
     if compression_enabled:
         services.append(COPILOT_COMPRESSION_SERVICE_NAME)
     return services
@@ -400,8 +404,8 @@ def _resolve_execution_run_id(context: RuntimeExecutionContext) -> str:
 
 def _resolve_compose_project_name(context: RuntimeExecutionContext) -> str:
     for value in (
-        _resolve_runtime_option(context, "copilot_compose_project"),
         os.getenv("SOMA_COPILOT_COMPOSE_PROJECT"),
+        _resolve_runtime_option(context, "copilot_compose_project"),
     ):
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -415,8 +419,8 @@ def _resolve_compose_project_name(context: RuntimeExecutionContext) -> str:
 
 def _resolve_shared_proxy_batch_enabled(context: RuntimeExecutionContext) -> bool:
     for value in (
-        _resolve_runtime_option(context, "copilot_shared_proxy"),
         os.getenv("SOMA_COPILOT_SHARED_PROXY"),
+        _resolve_runtime_option(context, "copilot_shared_proxy"),
     ):
         option = _coerce_bool_option(value)
         if option is not None:
@@ -426,8 +430,8 @@ def _resolve_shared_proxy_batch_enabled(context: RuntimeExecutionContext) -> boo
 
 def _resolve_shared_proxy_teardown_enabled(context: RuntimeExecutionContext) -> bool:
     for value in (
-        _resolve_runtime_option(context, "copilot_shared_proxy_teardown"),
         os.getenv("SOMA_COPILOT_SHARED_PROXY_TEARDOWN"),
+        _resolve_runtime_option(context, "copilot_shared_proxy_teardown"),
     ):
         option = _coerce_bool_option(value)
         if option is not None:
@@ -504,6 +508,7 @@ def _workspace_volume_name(*, compose_project: str) -> str:
 
 def _seed_workspace_volume(*, compose_project: str, repo_root: Path) -> str:
     volume_name = _workspace_volume_name(compose_project=compose_project)
+    _run_command(["docker", "volume", "rm", "-f", volume_name])
     create_result = _run_command(["docker", "volume", "create", volume_name])
     if create_result.returncode != 0:
         raise RuntimeError(
@@ -527,6 +532,7 @@ def _seed_workspace_volume(*, compose_project: str, repo_root: Path) -> str:
         ]
     )
     if copy_result.returncode != 0:
+        _remove_workspace_volume(volume_name=volume_name)
         raise RuntimeError(
             "Failed to seed Copilot workspace volume from repository checkout. "
             f"{(copy_result.stderr or copy_result.stdout or '').strip()}"
@@ -544,6 +550,49 @@ def _remove_workspace_volume(*, volume_name: str) -> None:
             f"[copilot] failed to remove workspace volume {volume_name}: {details}",
             component="copilot",
         )
+
+
+def _capture_workspace_patch(*, volume_name: str, tmp_run_dir: Path) -> dict[str, Any]:
+    patch_eval_dir = tmp_run_dir / "patch-eval"
+    patch_eval_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = patch_eval_dir / "agent.patch"
+    snapshot_dir = patch_eval_dir / "workspace-snapshot"
+    if snapshot_dir.exists():
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    copy_result = _run_command(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{volume_name}:/workspace:ro",
+            "-v",
+            f"{snapshot_dir.resolve()}:/snapshot",
+            "alpine:3.20",
+            "sh",
+            "-lc",
+            "cp -a /workspace/. /snapshot/",
+        ]
+    )
+    if copy_result.returncode != 0:
+        patch_path.write_text("", encoding="utf-8")
+        return {
+            "status": "error",
+            "error": (
+                copy_result.stderr
+                or copy_result.stdout
+                or "failed to copy workspace volume snapshot for patch capture"
+            ).strip(),
+            "repo_dir": str(snapshot_dir),
+            "patch_path": str(patch_path),
+            "has_changes": False,
+            "line_count": 0,
+            "size_bytes": 0,
+        }
+
+    return capture_repo_patch(repo_dir=snapshot_dir, output_dir=patch_eval_dir)
 
 
 def _run_command(
@@ -632,14 +681,53 @@ def _write_copilot_trajectory(
     *,
     stdout: str,
     output_format: str,
-    tmp_run_dir: Path,
+    destination_path: Path,
 ) -> Path | None:
     if output_format != "json":
         return None
-    tmp_run_dir.mkdir(parents=True, exist_ok=True)
-    trajectory_path = tmp_run_dir / "copilot-trajectory.jsonl"
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    trajectory_path = destination_path
     trajectory_path.write_text(_extract_jsonl_lines(stdout), encoding="utf-8")
     return trajectory_path
+
+
+def _count_trajectory_steps(trajectory_path: Path) -> int | None:
+    """Count agent steps from a copilot trajectory JSONL file.
+
+    Uses the last assistant.turn_end event's turnId (0-indexed) + 1.
+    Falls back to counting assistant.turn_start events if no turn_end is found.
+    """
+    try:
+        if not trajectory_path.is_file():
+            return None
+        last_turn_end: dict | None = None
+        turn_start_count = 0
+        with trajectory_path.open(encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                entry_type = entry.get("type")
+                if entry_type == "assistant.turn_start":
+                    turn_start_count += 1
+                elif entry_type == "assistant.turn_end":
+                    last_turn_end = entry
+        if last_turn_end is not None:
+            turn_id_raw = (last_turn_end.get("data") or {}).get("turnId")
+            if turn_id_raw is not None:
+                try:
+                    return int(turn_id_raw) + 1
+                except (TypeError, ValueError):
+                    pass
+        if turn_start_count > 0:
+            return turn_start_count
+        return None
+    except Exception:
+        return None
 
 
 def _extract_jsonl_lines(stdout: str) -> str:
@@ -774,6 +862,30 @@ def _collect_compose_service_logs(
         log_paths[f"{service_name}_log"] = str(log_path)
 
     return log_paths
+
+
+_PROXY_TOKEN_USAGE_MARKER = "[proxy][token-usage] "
+
+
+def _extract_proxy_token_usage(*, sidecar_log_paths: dict[str, str]) -> dict[str, int]:
+    proxy_log_path = sidecar_log_paths.get("proxy_log", "")
+    if not proxy_log_path:
+        return {}
+    log_file = Path(proxy_log_path)
+    if not log_file.is_file():
+        return {}
+    last_usage: dict[str, int] = {}
+    for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        idx = line.find(_PROXY_TOKEN_USAGE_MARKER)
+        if idx == -1:
+            continue
+        try:
+            parsed = json.loads(line[idx + len(_PROXY_TOKEN_USAGE_MARKER):])
+            if isinstance(parsed, dict):
+                last_usage = {k: v for k, v in parsed.items() if isinstance(v, int)}
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return last_usage
 
 
 def _extract_message_request_logs(*, sidecar_log_paths: dict[str, str], destination_dir: Path) -> dict[str, str]:
@@ -917,6 +1029,12 @@ def _error_summary(stderr: str, stdout: str) -> str:
     return "Copilot execution failed"
 
 
+def _resolve_benchmark_trajectory_path(context: RuntimeExecutionContext) -> Path:
+    safe_instance_id = str(context.instance.instance_id or context.instance.benchmark_id or "instance")
+    safe_instance_id = safe_instance_id.replace("/", "_").replace("\\", "_")
+    return (context.output_dir / f"copilot-trajectory-{safe_instance_id}.jsonl").resolve()
+
+
 def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionResult:
     if context.workspace != "docker":
         raise RuntimeError(COPILOT_WORKSPACE_ERROR.format(workspace=context.workspace))
@@ -939,6 +1057,12 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     swe_sandbox_service = _resolve_swe_sandbox_service(context)
     swe_sandbox_repo_path = _resolve_swe_sandbox_repo_path(context)
     swe_sandbox_image = _resolve_swe_sandbox_image(context)
+    shared_proxy_mode = _resolve_shared_proxy_batch_enabled(context)
+    compose_swe_sandbox_enabled = (
+        swe_sandbox_enabled
+        and swe_sandbox_image is not None
+        and not shared_proxy_mode
+    )
     compression_enabled = True
     use_compose_compression_service = _resolve_use_compose_compression_service(context)
     compression_image = _resolve_compression_service_image(context)
@@ -954,8 +1078,9 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         context,
         proxy_service=proxy_service,
         compression_enabled=use_compose_compression_service,
+        include_proxy=network_isolation,
     )
-    if swe_sandbox_enabled and swe_sandbox_image:
+    if compose_swe_sandbox_enabled:
         stack_services.append(swe_sandbox_service)
     prompt = _build_prompt(context)
 
@@ -1024,7 +1149,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             build_context=compression_build_context or _resolve_compression_service_build_context(context),
         )
 
-    should_start_stack = network_isolation or (swe_sandbox_enabled and swe_sandbox_image is not None)
+    should_start_stack = network_isolation or compose_swe_sandbox_enabled
     if should_start_stack:
         # Ensure compose also manages profile-gated sidecars during ps/down.
         existing_profiles = str(env.get("COMPOSE_PROFILES", "")).strip()
@@ -1036,7 +1161,8 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             env["COMPOSE_PROFILES"] = "copilot-sidecars"
 
     workspace_volume = _seed_workspace_volume(compose_project=compose_project, repo_root=repo_root)
-    if swe_sandbox_enabled and swe_sandbox_image:
+    env["COPILOT_WORKSPACE_VOLUME_NAME"] = workspace_volume
+    if compose_swe_sandbox_enabled:
         env["COPILOT_SWE_SANDBOX_IMAGE"] = swe_sandbox_image
     if network_isolation:
         base_url_raw = str(context.llm_config.get("base_url", "")).strip()
@@ -1072,74 +1198,87 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     swe_sandbox_container_name = ""
     sidecar_log_paths: dict[str, str] = {}
     message_request_log_paths: dict[str, str] = {}
+    proxy_token_usage: dict[str, int] = {}
+    patch_capture: dict[str, Any] = {
+        "status": "not-captured",
+        "repo_dir": "",
+        "patch_path": "",
+        "has_changes": False,
+        "line_count": 0,
+        "size_bytes": 0,
+    }
 
-    if should_start_stack:
-        stack_up = _run_command(
-            [*compose_prefix, "up", "-d", *stack_services],
-            cwd=repo_root,
-            env=env,
-        )
-        stack_up_stdout = stack_up.stdout or ""
-        stack_up_stderr = stack_up.stderr or ""
-        if stack_up.returncode != 0:
-            raise RuntimeError(
-                "Failed to start Copilot proxy sidecar. "
-                f"{(stack_up.stderr or stack_up.stdout or '').strip()}"
-            )
-
-    if swe_sandbox_enabled and swe_sandbox_image:
-        sandbox_ps = _run_command(
-            [*compose_prefix, "ps", "-q", swe_sandbox_service],
-            cwd=repo_root,
-            env=env,
-        )
-        swe_sandbox_container_id = (sandbox_ps.stdout or "").strip().splitlines()[0] if (sandbox_ps.stdout or "").strip() else ""
-        if not swe_sandbox_container_id:
-            raise RuntimeError(
-                "Copilot SWE sandbox container is not running after compose up. "
-                f"{(sandbox_ps.stderr or sandbox_ps.stdout or '').strip()}"
-            )
-        inspect_name = _run_command(["docker", "inspect", "-f", "{{.Name}}", swe_sandbox_container_id])
-        if inspect_name.returncode == 0:
-            swe_sandbox_container_name = (inspect_name.stdout or "").strip().lstrip("/")
-        if not swe_sandbox_container_name:
-            swe_sandbox_container_name = swe_sandbox_container_id
-
-        env["SWE_BENCH_SANDBOX_CONTAINER_ID"] = swe_sandbox_container_id
-        env["SWE_BENCH_SANDBOX_CONTAINER_NAME"] = swe_sandbox_container_name
-        env["SWE_BENCH_SANDBOX_REPO_PATH"] = swe_sandbox_repo_path
-        run_container_args.extend(_docker_socket_mount_args())
-        run_container_args.extend(["--user", "root"])
-        run_container_args.extend([
-            "-e",
-            "SWE_BENCH_SANDBOX_CONTAINER_ID",
-            "-e",
-            "SWE_BENCH_SANDBOX_CONTAINER_NAME",
-            "-e",
-            "SWE_BENCH_SANDBOX_REPO_PATH",
-        ])
-        command = [
-            *compose_prefix,
-            "run",
-            "--rm",
-            *run_container_args,
-            "-e",
-            "COPILOT_PROVIDER_BASE_URL",
-            "-e",
-            "COPILOT_MODEL",
-            "-e",
-            "COPILOT_PROVIDER_API_KEY",
-            service,
-            "-p",
-            prompt,
-            *extra_args,
-        ]
-
+    stack_up_attempted = False
     try:
+        if should_start_stack:
+            stack_up_attempted = True
+            stack_up = _run_command(
+                [*compose_prefix, "up", "-d", *stack_services],
+                cwd=repo_root,
+                env=env,
+            )
+            stack_up_stdout = stack_up.stdout or ""
+            stack_up_stderr = stack_up.stderr or ""
+            if stack_up.returncode != 0:
+                raise RuntimeError(
+                    "Failed to start Copilot proxy sidecar. "
+                    f"{(stack_up.stderr or stack_up.stdout or '').strip()}"
+                )
+
+        if compose_swe_sandbox_enabled:
+            sandbox_ps = _run_command(
+                [*compose_prefix, "ps", "-q", swe_sandbox_service],
+                cwd=repo_root,
+                env=env,
+            )
+            swe_sandbox_container_id = (sandbox_ps.stdout or "").strip().splitlines()[0] if (sandbox_ps.stdout or "").strip() else ""
+            if not swe_sandbox_container_id:
+                raise RuntimeError(
+                    "Copilot SWE sandbox container is not running after compose up. "
+                    f"{(sandbox_ps.stderr or sandbox_ps.stdout or '').strip()}"
+                )
+            inspect_name = _run_command(["docker", "inspect", "-f", "{{.Name}}", swe_sandbox_container_id])
+            if inspect_name.returncode == 0:
+                swe_sandbox_container_name = (inspect_name.stdout or "").strip().lstrip("/")
+            if not swe_sandbox_container_name:
+                swe_sandbox_container_name = swe_sandbox_container_id
+
+            env["SWE_BENCH_SANDBOX_CONTAINER_ID"] = swe_sandbox_container_id
+            env["SWE_BENCH_SANDBOX_CONTAINER_NAME"] = swe_sandbox_container_name
+            env["SWE_BENCH_SANDBOX_REPO_PATH"] = swe_sandbox_repo_path
+            run_container_args.extend(_docker_socket_mount_args())
+            run_container_args.extend(["--user", "root"])
+            run_container_args.extend([
+                "-e",
+                "SWE_BENCH_SANDBOX_CONTAINER_ID",
+                "-e",
+                "SWE_BENCH_SANDBOX_CONTAINER_NAME",
+                "-e",
+                "SWE_BENCH_SANDBOX_REPO_PATH",
+            ])
+            command = [
+                *compose_prefix,
+                "run",
+                "--rm",
+                *run_container_args,
+                "-e",
+                "COPILOT_PROVIDER_BASE_URL",
+                "-e",
+                "COPILOT_MODEL",
+                "-e",
+                "COPILOT_PROVIDER_API_KEY",
+                service,
+                "-p",
+                prompt,
+                *extra_args,
+            ]
+
+        benchmark_trajectory_path: Path | None = None
         live_trajectory_path: Path | None = None
         live_stream_log_path: Path | None = None
         if output_format == "json":
-            live_trajectory_path = tmp_run_dir / "copilot-trajectory.jsonl"
+            benchmark_trajectory_path = _resolve_benchmark_trajectory_path(context)
+            live_trajectory_path = benchmark_trajectory_path
         live_stream_log_path = tmp_run_dir / "copilot-stream.log"
 
         result = _run_copilot_command_streaming(
@@ -1152,18 +1291,34 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
 
         trajectory_path = live_trajectory_path
         if trajectory_path is None:
+            if benchmark_trajectory_path is None:
+                benchmark_trajectory_path = _resolve_benchmark_trajectory_path(context)
             trajectory_path = _write_copilot_trajectory(
                 stdout=result.stdout or "",
                 output_format=output_format,
-                tmp_run_dir=tmp_run_dir,
+                destination_path=benchmark_trajectory_path,
             )
+        agent_steps: int | None = None
         if trajectory_path is not None:
             emit_progress(
                 f"[{context.instance.instance_id}] Copilot trajectory saved to {trajectory_path}",
                 component="copilot",
             )
+            agent_steps = _count_trajectory_steps(trajectory_path)
+        emit_progress(
+            f"[{context.instance.instance_id}] capturing repository patch from workspace volume",
+            component="copilot",
+        )
+        patch_capture = _capture_workspace_patch(
+            volume_name=workspace_volume,
+            tmp_run_dir=tmp_run_dir,
+        )
+        emit_progress(
+            f"[{context.instance.instance_id}] patch capture status: {patch_capture.get('status')} changes={patch_capture.get('has_changes')}",
+            component="copilot",
+        )
     finally:
-        if should_start_stack:
+        if stack_up_attempted:
             sidecar_services = [service_name for service_name in {proxy_service, COPILOT_DEFAULT_PROXY_SERVICE, "compression-service"}]
             sidecar_log_paths = _collect_compose_service_logs(
                 compose_prefix=compose_prefix,
@@ -1176,7 +1331,8 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 sidecar_log_paths=sidecar_log_paths,
                 destination_dir=tmp_run_dir,
             )
-        if should_start_stack and not keep_stack:
+            proxy_token_usage = _extract_proxy_token_usage(sidecar_log_paths=sidecar_log_paths)
+        if stack_up_attempted and not keep_stack:
             stack_down = _run_command(
                 [*compose_prefix, "down", "--remove-orphans", "--volumes"],
                 cwd=repo_root,
@@ -1184,9 +1340,10 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             )
             stack_down_stdout = stack_down.stdout or ""
             stack_down_stderr = stack_down.stderr or ""
-
-    if not keep_stack:
-        _remove_workspace_volume(volume_name=workspace_volume)
+            for _net_suffix in ("copilot-sandbox", "copilot-egress"):
+                _run_command(["docker", "network", "rm", f"{compose_project}_{_net_suffix}"])
+        if not keep_stack:
+            _remove_workspace_volume(volume_name=workspace_volume)
 
     if cleanup_repo:
         if repo_root.is_dir():
@@ -1242,6 +1399,9 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "copilot_output_format": output_format,
         "trajectory_path": str(trajectory_path) if trajectory_path is not None else "",
         "stream_log_path": str((tmp_run_dir / "copilot-stream.log").resolve()),
+        "agent_steps": agent_steps,
+        "patch_capture": patch_capture,
+        "token_usage": proxy_token_usage,
         **sidecar_log_paths,
         **message_request_log_paths,
         **log_paths,

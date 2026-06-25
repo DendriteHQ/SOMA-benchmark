@@ -4,10 +4,10 @@ import importlib.util
 import inspect
 import json
 import os
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
-
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -76,9 +76,14 @@ def _load_compressor_module() -> ModuleType | None:
     if spec is None or spec.loader is None:
         return None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Ensure decorators/type resolution that rely on sys.modules can find the module during import.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
     return module
-
 
 def _resolve_compressor_callable(module: ModuleType | None) -> Callable[..., Any] | None:
     if module is None:

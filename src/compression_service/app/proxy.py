@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -29,6 +30,58 @@ HOP_BY_HOP_HEADERS = {
 }
 
 app = FastAPI(title="SOMA Copilot Custom Proxy", version="0.1.0")
+
+_token_lock = asyncio.Lock()
+_token_totals: dict[str, int] = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": 0,
+}
+
+TOKEN_USAGE_LOG_MARKER = "[proxy][token-usage] "
+
+
+def _extract_usage_from_response(response_body: bytes) -> dict | None:
+    try:
+        data = json.loads(response_body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return usage
+
+
+async def _accumulate_token_usage(usage: dict) -> None:
+    prompt_details = usage.get("prompt_tokens_details")
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+
+    # Anthropic format: input_tokens = non-cached only, cache_read_input_tokens = cached
+    # OpenAI/Qwen format: prompt_tokens = total (includes cached), cached_tokens = subset
+    # Normalize to Anthropic semantics so total = input + cached + output (no double-count)
+    if "input_tokens" in usage:
+        raw_input = usage["input_tokens"]
+        cache_read = usage.get("cache_read_input_tokens", 0)
+        cache_write = usage.get("cache_creation_input_tokens", 0)
+    else:
+        raw_prompt = usage.get("prompt_tokens") or 0
+        cache_read = prompt_details.get("cached_tokens") or 0
+        cache_write = prompt_details.get("cache_write_tokens") or 0
+        raw_input = raw_prompt - cache_read  # non-cached portion only
+
+    async with _token_lock:
+        _token_totals["input_tokens"] += max(raw_input, 0)
+        _token_totals["output_tokens"] += (
+            usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        )
+        _token_totals["cache_read_tokens"] += cache_read
+        _token_totals["cache_creation_tokens"] += cache_write
+        snapshot = dict(_token_totals)
+    print(f"{TOKEN_USAGE_LOG_MARKER}{json.dumps(snapshot)}", flush=True)
 
 
 def _coerce_bool(raw_value: Any, *, default: bool = False) -> bool:
@@ -278,6 +331,11 @@ async def proxy_passthrough(path: str, request: Request) -> Response:
         with urlopen(upstream_request, timeout=_resolve_upstream_timeout_seconds()) as upstream_response:
             response_body = upstream_response.read()
             response_headers = _response_headers_from_upstream(list(upstream_response.headers.items()))
+            content_type = upstream_response.headers.get("content-type", "")
+            if "application/json" in content_type:
+                usage = _extract_usage_from_response(response_body)
+                if usage:
+                    await _accumulate_token_usage(usage)
             return Response(
                 content=response_body,
                 status_code=upstream_response.status,

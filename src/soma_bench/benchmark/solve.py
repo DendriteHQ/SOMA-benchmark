@@ -179,6 +179,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recreate the SOMA plugin Python environment once at the start of this benchmark process.",
     )
     parser.add_argument(
+        "--copilot-compression-script-path",
+        default=None,
+        help=(
+            "Optional path to compressor script mounted into compression-service as /app/miner/base_miner.py. "
+            "If omitted, backend falls back to src/compression_service/app/base_miner.py."
+        ),
+    )
+    parser.add_argument(
+        "--copilot-compression-service-autobuild",
+        action="store_true",
+        help=(
+            "Build compression-service image before each Copilot run when compression-service is enabled. "
+            "Uses src/compression_service by default."
+        ),
+    )
+    parser.add_argument(
+        "--copilot-compression-service-build-context",
+        default=None,
+        help=(
+            "Optional docker build context for compression-service autobuild. "
+            "Defaults to src/compression_service."
+        ),
+    )
+    parser.add_argument(
         "--swerebench-eval",
         action="store_true",
         help="After agent execution, export the resulting patch and run SWE-rebench evaluation through swebench.harness.",
@@ -287,6 +311,9 @@ def main(argv: list[str] | None = None) -> int:
         swerebench_cache_level=args.swerebench_cache_level,
         swerebench_timeout=args.swerebench_timeout,
         swerebench_max_workers=args.swerebench_max_workers,
+        copilot_compression_script_path=args.copilot_compression_script_path,
+        copilot_compression_service_autobuild=args.copilot_compression_service_autobuild,
+        copilot_compression_service_build_context=args.copilot_compression_service_build_context,
     )
 
     manifest_row = build_direct_manifest_row(

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from .copilot import COPILOT_BACKEND
 from .openclaw import OPENCLAW_BACKEND
 from .base import RuntimeBackend
 
 REGISTERED_BACKENDS: dict[str, RuntimeBackend] = {
+    COPILOT_BACKEND.name: COPILOT_BACKEND,
     OPENCLAW_BACKEND.name: OPENCLAW_BACKEND,
 }
 DEFAULT_RUNTIME_BACKEND = OPENCLAW_BACKEND.name

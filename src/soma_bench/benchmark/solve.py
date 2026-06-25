@@ -30,23 +30,98 @@ def _append_jsonl_row(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=True) + "\n")
 
 
-def _build_problem_statement(runtime_setup_entry: dict[str, Any]) -> str:
+BENCHMARK_TYPE_SWEBENCH_VERIFIED = "swebench_verified"
+BENCHMARK_TYPE_SWE_EXPLORER_EXPLORE = "swe_explorer_explore"
+BENCHMARK_TYPE_SWE_EXPLORER_EDIT = "swe_explorer_edit"
+BENCHMARK_TYPES = (
+    BENCHMARK_TYPE_SWEBENCH_VERIFIED,
+    BENCHMARK_TYPE_SWE_EXPLORER_EXPLORE,
+    BENCHMARK_TYPE_SWE_EXPLORER_EDIT,
+)
+
+_SWE_EXPLORER_EXPLORE_TOP_K = 20
+
+_SWE_EXPLORER_EXPLORE_TEMPLATE = """\
+You are a code exploration specialist. Explore this repository to find the
+source files and line ranges most relevant to understanding and fixing the
+following issue. Do NOT make any code changes.
+
+Use Glob, Grep, and Read tools to explore the codebase. Focus on finding
+the ROOT CAUSE, not just symptom locations.
+
+After exploration, output your findings in EXACTLY this format:
+
+RELEVANT_FILES:
+- path/to/file1.py:10-50
+- path/to/file2.py:1-100
+
+Focus on the root cause. Limit to top {top_k} most relevant regions.
+
+ISSUE:
+{issue}\
+"""
+
+_SWE_EXPLORER_EDIT_PREFIX = (
+    "The following files have been identified as the ones that require code changes to fix this issue:\n\n"
+)
+
+_SWE_EXPLORER_EDIT_SUFFIX = (
+    "\n\nPlease make the necessary code changes to the files listed above to fix the issue described below.\n\n"
+)
+
+
+def _build_problem_statement(
+    runtime_setup_entry: dict[str, Any],
+    benchmark_type: str = BENCHMARK_TYPE_SWEBENCH_VERIFIED,
+) -> str:
     hidden_eval = runtime_setup_entry.get("hidden_eval")
     if not isinstance(hidden_eval, dict):
         hidden_eval = {}
 
-    parts: list[str] = []
     problem_statement = str(hidden_eval.get("problem_statement", "")).strip()
+    hints_text = str(hidden_eval.get("hints_text", "")).strip()
+
+    if benchmark_type == BENCHMARK_TYPE_SWE_EXPLORER_EXPLORE:
+        issue_parts: list[str] = []
+        if problem_statement:
+            issue_parts.append(problem_statement)
+        if hints_text:
+            issue_parts.extend(["", "Hints:", hints_text])
+        if not issue_parts:
+            benchmark_name = str(hidden_eval.get("benchmark", "benchmark")).strip() or "benchmark"
+            instance_id_val = str(runtime_setup_entry.get("instance_id", "")).strip() or "unknown-instance"
+            issue_parts.append(f"Instance {instance_id_val} from {benchmark_name}.")
+        issue_text = "\n".join(issue_parts)
+        return _SWE_EXPLORER_EXPLORE_TEMPLATE.format(
+            top_k=_SWE_EXPLORER_EXPLORE_TOP_K,
+            issue=issue_text,
+        )
+
+    if benchmark_type == BENCHMARK_TYPE_SWE_EXPLORER_EDIT:
+        ground_truth = hidden_eval.get("ground_truth") or {}
+        if not isinstance(ground_truth, dict):
+            ground_truth = {}
+        modified_core_files = ground_truth.get("modified_core_files") or []
+        files_block = "\n".join(f"- {f}" for f in modified_core_files) if modified_core_files else "(no files specified)"
+        parts = [_SWE_EXPLORER_EDIT_PREFIX + files_block + _SWE_EXPLORER_EDIT_SUFFIX]
+        if problem_statement:
+            parts.append(problem_statement)
+        if hints_text:
+            parts.extend(["", "Hints:", hints_text])
+        if parts:
+            return "\n".join(parts)
+        benchmark_name = str(hidden_eval.get("benchmark", "benchmark")).strip() or "benchmark"
+        instance_id = str(runtime_setup_entry.get("instance_id", "")).strip() or "unknown-instance"
+        return f"Fix benchmark instance {instance_id} from {benchmark_name}."
+
+    # Default: BENCHMARK_TYPE_SWEBENCH_VERIFIED
+    parts = []
     if problem_statement:
         parts.append(problem_statement)
-
-    hints_text = str(hidden_eval.get("hints_text", "")).strip()
     if hints_text:
         parts.extend(["", "Hints:", hints_text])
-
     if parts:
         return "\n".join(parts)
-
     benchmark_name = str(hidden_eval.get("benchmark", "benchmark")).strip() or "benchmark"
     instance_id = str(runtime_setup_entry.get("instance_id", "")).strip() or "unknown-instance"
     return f"Solve benchmark instance {instance_id} from {benchmark_name}."
@@ -58,8 +133,9 @@ def build_direct_manifest_row(
     instance_id: str,
     runtime_setup_entry: dict[str, Any],
     runtime_options: dict[str, Any] | None = None,
+    benchmark_type: str = BENCHMARK_TYPE_SWEBENCH_VERIFIED,
 ) -> dict[str, Any]:
-    prompt = _build_problem_statement(runtime_setup_entry)
+    prompt = _build_problem_statement(runtime_setup_entry, benchmark_type=benchmark_type)
     hidden_eval = runtime_setup_entry.get("hidden_eval")
     if not isinstance(hidden_eval, dict):
         hidden_eval = {}
@@ -101,6 +177,7 @@ def build_direct_manifest_row(
             "source_type": "benchmark-problem-statement",
             "benchmark": benchmark_name,
             "instance_id": instance_id,
+            "benchmark_type": benchmark_type,
         },
     }
 
@@ -200,6 +277,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional docker build context for compression-service autobuild. "
             "Defaults to src/compression_service."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-type",
+        choices=list(BENCHMARK_TYPES),
+        default=BENCHMARK_TYPE_SWEBENCH_VERIFIED,
+        help=(
+            "Benchmark task type. 'swebench_verified': standard SWE-bench Verified solve mode (default). "
+            "'swe_explorer_explore': SWE-Explorer file exploration mode — agent explores the repo and "
+            "outputs regions read. 'swe_explorer_edit': SWE-Explorer edit mode — agent receives the "
+            "ground-truth modified files as a hint and produces a patch."
         ),
     )
     parser.add_argument(
@@ -321,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
         instance_id=args.instance_id,
         runtime_setup_entry=benchmark_config.runtime_setup_entry,
         runtime_options=runtime_options,
+        benchmark_type=args.benchmark_type,
     )
     write_jsonl(manifest_output_file, [manifest_row])
 
@@ -367,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
             "type": "benchmark-problem-statement",
             "benchmark": benchmark_config.benchmark_name,
             "instance_id": args.instance_id,
+            "benchmark_type": args.benchmark_type,
         },
         "runtime_options": runtime_options,
         "run_plan": run_plan,
@@ -449,6 +539,7 @@ def main(argv: list[str] | None = None) -> int:
             "type": "benchmark-problem-statement",
             "benchmark": benchmark_config.benchmark_name,
             "instance_id": args.instance_id,
+            "benchmark_type": args.benchmark_type,
         },
         "manifest_row_count": len(instances),
         "planned_image_count": len(image_plan),

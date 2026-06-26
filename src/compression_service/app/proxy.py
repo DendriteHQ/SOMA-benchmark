@@ -31,6 +31,11 @@ HOP_BY_HOP_HEADERS = {
 
 app = FastAPI(title="SOMA Copilot Custom Proxy", version="0.1.0")
 
+# Resolve upstream URL once at module load — never changes at runtime.
+# This guarantees the proxy only ever forwards to the single configured host.
+_UPSTREAM_BASE_URL: str = _resolve_upstream_base_url()
+_UPSTREAM_NETLOC: str = urlsplit(_UPSTREAM_BASE_URL).netloc
+
 _token_lock = asyncio.Lock()
 _token_totals: dict[str, int] = {
     "input_tokens": 0,
@@ -274,7 +279,7 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "status": "ok",
-            "upstream": _resolve_upstream_base_url(),
+            "upstream": _UPSTREAM_BASE_URL,
             "compression_base_url": _resolve_compression_base_url(),
             "compression_enabled": _resolve_compression_enabled(),
             "api_key_override_enabled": bool(_resolve_provider_api_key_override()),
@@ -286,8 +291,9 @@ def health() -> JSONResponse:
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_passthrough(path: str, request: Request) -> Response:
     request_id = uuid.uuid4().hex
-    upstream_base_url = _resolve_upstream_base_url()
-    upstream_url = _build_upstream_url(base_url=upstream_base_url, path=path, query=request.url.query)
+    upstream_url = _build_upstream_url(base_url=_UPSTREAM_BASE_URL, path=path, query=request.url.query)
+    if urlsplit(upstream_url).netloc != _UPSTREAM_NETLOC:
+        raise HTTPException(status_code=400, detail="Upstream host mismatch — only configured host is allowed")
 
     method = request.method.upper()
     body = await request.body()

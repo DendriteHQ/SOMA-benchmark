@@ -27,6 +27,8 @@ services:
       - PROXY_PROVIDER_API_KEY=${PROXY_PROVIDER_API_KEY:-}
       - PROXY_RUN_ID_HEADER_VALUE=${PROXY_RUN_ID_HEADER_VALUE:-}
       - PORT=${COPILOT_PROXY_PORT:-8080}
+    security_opt:
+      - no-new-privileges:true
     command:
       - uvicorn
       - app.proxy:app
@@ -45,6 +47,10 @@ services:
       - COMPRESSION_MUTATE_REQUEST=${COMPRESSION_MUTATE_REQUEST:-true}
     volumes:
       - ${COPILOT_COMPRESSION_SCRIPT_PATH:-/dev/null}:/app/miner/base_miner.py:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     profiles:
       - copilot-sidecars
     networks:

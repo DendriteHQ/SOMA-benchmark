@@ -7,7 +7,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-cache the cl100k_base tiktoken encoding so the miner can run offline.
-# tiktoken looks up encodings by SHA256 in TIKTOKEN_CACHE_DIR (default ~/.tiktoken).
+# Store in /app/.tiktoken so the non-root user can read it at runtime.
+ENV TIKTOKEN_CACHE_DIR=/app/.tiktoken
 RUN python - <<'EOF'
 import tiktoken
 tiktoken.get_encoding("cl100k_base")
@@ -20,9 +21,15 @@ COPY app/ ./app/
 # Create the directory where base_miner.py will be volume-mounted at runtime
 RUN mkdir -p /app/miner
 
+# Non-root user — miner needs write access to /app for cache files
+RUN useradd --no-create-home --shell /bin/false appuser \
+    && chown -R appuser:appuser /app
+
 ENV MINER_MODULE_PATH=/app/miner/base_miner.py
 ENV LOG_LEVEL=INFO
 ENV PORT=8000
+
+USER appuser
 
 EXPOSE 8000
 

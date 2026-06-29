@@ -611,6 +611,174 @@ def _run_command(
     )
 
 
+def _ensure_bridge_netfilter() -> bool:
+    """Load br_netfilter and enable bridge iptables filtering if not already active.
+
+    Same-bridge Docker traffic bypasses iptables FORWARD by default (L2 path).
+    This is required once per host before iptables DROP rules take effect.
+    Non-fatal: returns False with a warning when privileges are insufficient.
+    """
+    sysctl_path = Path("/proc/sys/net/bridge/bridge-nf-call-iptables")
+
+    if not Path("/sys/module/br_netfilter").is_dir():
+        result = _run_command(["modprobe", "br_netfilter"])
+        if result.returncode != 0:
+            emit_progress(
+                "[copilot] br_netfilter could not be loaded — iptables isolation will not be "
+                f"effective: {(result.stderr or result.stdout or '').strip()}",
+                component="copilot",
+            )
+            return False
+        emit_progress("[copilot] loaded br_netfilter kernel module", component="copilot")
+
+    if not sysctl_path.is_file():
+        emit_progress(
+            "[copilot] bridge-nf-call-iptables sysctl unavailable — isolation not effective",
+            component="copilot",
+        )
+        return False
+
+    try:
+        if sysctl_path.read_text().strip() != "1":
+            result = _run_command(["sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1"])
+            if result.returncode != 0:
+                emit_progress(
+                    f"[copilot] failed to set bridge-nf-call-iptables=1 — isolation not effective: "
+                    f"{(result.stderr or result.stdout or '').strip()}",
+                    component="copilot",
+                )
+                return False
+            emit_progress("[copilot] set net.bridge.bridge-nf-call-iptables=1", component="copilot")
+    except OSError as exc:
+        emit_progress(f"[copilot] bridge-nf-call-iptables read/write error: {exc}", component="copilot")
+        return False
+
+    return True
+
+
+def _get_container_network_ips(container_name: str) -> dict[str, str]:
+    result = _run_command(["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", container_name])
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        return {}
+    try:
+        networks = json.loads((result.stdout or "").strip())
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return {
+        name: info.get("IPAddress", "")
+        for name, info in networks.items()
+        if isinstance(info, dict) and info.get("IPAddress")
+    }
+
+
+def _iptables_purge_stale_soma_rules() -> None:
+    """Remove any leftover soma-iso-* rules from crashed/killed previous runs.
+
+    When a benchmark process is SIGKILL-ed the finally block may not run, leaving
+    rules that reference IPs Docker has since reassigned to different containers.
+    """
+    for chain in ("DOCKER-USER", "FORWARD"):
+        while True:
+            result = _run_command(["iptables", "-L", chain, "--line-numbers", "-n"])
+            if result.returncode != 0:
+                break
+            line_to_delete = None
+            for line in (result.stdout or "").splitlines():
+                if "soma-iso-" in line:
+                    try:
+                        line_to_delete = line.split()[0]
+                    except IndexError:
+                        pass
+                    break
+            if line_to_delete is None:
+                break
+            _run_command(["iptables", "-D", chain, line_to_delete])
+
+
+def _iptables_insert_drop(*, src_ip: str, dst_ip: str, comment: str) -> bool:
+    chain = "DOCKER-USER"
+    if _run_command(["iptables", "-L", chain, "-n"]).returncode != 0:
+        chain = "FORWARD"
+    # --ctstate NEW: only block connection initiations, not reply packets for
+    # connections proxy opened toward compression-service.
+    result = _run_command([
+        "iptables", "-I", chain, "1",
+        "-s", src_ip, "-d", dst_ip, "-p", "tcp",
+        "-m", "conntrack", "--ctstate", "NEW",
+        "-m", "comment", "--comment", comment,
+        "-j", "DROP",
+    ])
+    return result.returncode == 0
+
+
+def _iptables_delete_drop(*, src_ip: str, dst_ip: str, comment: str) -> None:
+    for chain in ("DOCKER-USER", "FORWARD"):
+        _run_command([
+            "iptables", "-D", chain,
+            "-s", src_ip, "-d", dst_ip, "-p", "tcp",
+            "-m", "conntrack", "--ctstate", "NEW",
+            "-m", "comment", "--comment", comment,
+            "-j", "DROP",
+        ])
+
+
+def _apply_proxy_compression_isolation(
+    *,
+    compose_project: str,
+    proxy_service: str,
+) -> list[tuple[str, str, str]]:
+    """Block TCP from compression-service to proxy (one-way: proxy may still call compression-service).
+
+    Returns inserted rules as (src_ip, dst_ip, comment) tuples for later removal.
+    """
+    if not _ensure_bridge_netfilter():
+        return []
+
+    _iptables_purge_stale_soma_rules()
+
+    comp_name = f"{compose_project}-{COPILOT_COMPRESSION_SERVICE_NAME}-1"
+    proxy_name = f"{compose_project}-{proxy_service}-1"
+    comp_ips = _get_container_network_ips(comp_name)
+    proxy_ips = _get_container_network_ips(proxy_name)
+
+    sandbox_key = next((k for k in comp_ips if "sandbox" in k), None)
+    comp_ip = comp_ips.get(sandbox_key, "") if sandbox_key else next(iter(comp_ips.values()), "")
+    if sandbox_key and sandbox_key in proxy_ips:
+        proxy_ip = proxy_ips[sandbox_key]
+    else:
+        proxy_ip = next(iter(proxy_ips.values()), "")
+
+    if not comp_ip or not proxy_ip:
+        emit_progress(
+            f"[copilot] iptables isolation skipped: could not resolve container IPs "
+            f"(comp={comp_ip!r} proxy={proxy_ip!r})",
+            component="copilot",
+        )
+        return []
+
+    comment = f"soma-iso-{compose_project[-16:]}"
+    if _iptables_insert_drop(src_ip=comp_ip, dst_ip=proxy_ip, comment=comment):
+        emit_progress(
+            f"[copilot] iptables DROP: compression ({comp_ip}) -> proxy ({proxy_ip}) tcp",
+            component="copilot",
+        )
+        return [(comp_ip, proxy_ip, comment)]
+    emit_progress(
+        "[copilot] iptables DROP rule insert failed (insufficient privileges?)",
+        component="copilot",
+    )
+    return []
+
+
+def _remove_proxy_compression_isolation(rules: list[tuple[str, str, str]]) -> None:
+    for src_ip, dst_ip, comment in rules:
+        _iptables_delete_drop(src_ip=src_ip, dst_ip=dst_ip, comment=comment)
+        emit_progress(
+            f"[copilot] iptables removed isolation rule: ({src_ip}) -> ({dst_ip})",
+            component="copilot",
+        )
+
+
 def _resolve_repo_clone_url(repo: str) -> str:
     normalized = repo.strip()
     if not normalized:
@@ -1208,6 +1376,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "size_bytes": 0,
     }
 
+    isolation_rules: list[tuple[str, str, str]] = []
     stack_up_attempted = False
     try:
         if should_start_stack:
@@ -1223,6 +1392,11 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 raise RuntimeError(
                     "Failed to start Copilot proxy sidecar. "
                     f"{(stack_up.stderr or stack_up.stdout or '').strip()}"
+                )
+            if network_isolation and use_compose_compression_service:
+                isolation_rules = _apply_proxy_compression_isolation(
+                    compose_project=compose_project,
+                    proxy_service=proxy_service,
                 )
 
         if compose_swe_sandbox_enabled:
@@ -1332,6 +1506,8 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 destination_dir=tmp_run_dir,
             )
             proxy_token_usage = _extract_proxy_token_usage(sidecar_log_paths=sidecar_log_paths)
+        if isolation_rules:
+            _remove_proxy_compression_isolation(isolation_rules)
         if stack_up_attempted and not keep_stack:
             stack_down = _run_command(
                 [*compose_prefix, "down", "--remove-orphans", "--volumes"],

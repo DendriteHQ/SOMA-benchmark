@@ -42,6 +42,8 @@ BENCHMARK_TYPES = (
 _SWE_EXPLORER_BENCHMARK_NAME = "SWE-Explore-Bench/SWE-Explore-Bench"
 _SWE_EXPLORER_EXPLORE_TOP_K = 20
 
+_SWE_EXPLORER_EXPLORE_RESULT_FILE = "/workspace/explore-result.json"
+
 _SWE_EXPLORER_EXPLORE_TEMPLATE = """\
 You are a code exploration specialist. Explore this repository to find the
 source files and line ranges most relevant to understanding and fixing the
@@ -50,8 +52,9 @@ following issue. Do NOT make any code changes.
 Use Glob, Grep, and Read tools to explore the codebase. Focus on finding
 the ROOT CAUSE, not just symptom locations.
 
-After exploration, output your findings as a JSON array in EXACTLY this format
-and nothing else after it:
+When you have finished exploring, write your findings to the file
+`{result_file}` using the Write tool. The file must contain ONLY a JSON
+array in exactly this format (no markdown, no explanation, no extra text):
 
 [
   {{"path": "path/to/file1.py", "start": 10, "end": 50}},
@@ -59,6 +62,10 @@ and nothing else after it:
 ]
 
 Focus on the root cause. Limit to top {top_k} most relevant regions.
+Use relative paths from the repository root (e.g. "django/db/models/base.py"),
+not absolute paths starting with /workspace/.
+
+Expected coverage: aim to find {n_source} source file(s) and {n_test} test file(s).
 
 ISSUE:
 {issue}\
@@ -71,6 +78,23 @@ _SWE_EXPLORER_EDIT_PREFIX = (
 _SWE_EXPLORER_EDIT_SUFFIX = (
     "\n\nPlease make the necessary code changes to the files listed above to fix the issue described below.\n\n"
 )
+
+
+def _count_explore_files(ground_truth: dict[str, Any]) -> tuple[int, int]:
+    """Return (n_source, n_test) counts from ground_truth.read_core_files."""
+    files: list[str] = ground_truth.get("read_core_files") or []
+    n_test = sum(
+        1 for f in files
+        if (
+            f.startswith("tests/")
+            or "/tests/" in f
+            or "/test/" in f
+            or f.startswith("test/")
+            or f.rsplit("/", 1)[-1].startswith("test_")
+            or f.rsplit("/", 1)[-1].endswith(("_test.py", "_tests.py", "tests.py"))
+        )
+    )
+    return len(files) - n_test, n_test
 
 
 def _build_problem_statement(
@@ -95,8 +119,13 @@ def _build_problem_statement(
             instance_id_val = str(runtime_setup_entry.get("instance_id", "")).strip() or "unknown-instance"
             issue_parts.append(f"Instance {instance_id_val} from {benchmark_name}.")
         issue_text = "\n".join(issue_parts)
+        ground_truth = hidden_eval.get("ground_truth") or {}
+        n_source, n_test = _count_explore_files(ground_truth)
         return _SWE_EXPLORER_EXPLORE_TEMPLATE.format(
             top_k=_SWE_EXPLORER_EXPLORE_TOP_K,
+            result_file=_SWE_EXPLORER_EXPLORE_RESULT_FILE,
+            n_source=n_source or "?",
+            n_test=n_test or "?",
             issue=issue_text,
         )
 
@@ -424,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
         copilot_compression_service_build_context=args.copilot_compression_service_build_context,
     )
 
-    if args.benchmark_type == BENCHMARK_TYPE_SWE_EXPLORER_EDIT:
+    if args.benchmark_type in (BENCHMARK_TYPE_SWE_EXPLORER_EDIT, BENCHMARK_TYPE_SWE_EXPLORER_EXPLORE):
         _inject_swe_explorer_ground_truth(benchmark_config.runtime_setup_entry, args.instance_id)
 
     manifest_row = build_direct_manifest_row(

@@ -31,11 +31,6 @@ HOP_BY_HOP_HEADERS = {
 
 app = FastAPI(title="SOMA Copilot Custom Proxy", version="0.1.0")
 
-# Resolve upstream URL once at module load — never changes at runtime.
-# This guarantees the proxy only ever forwards to the single configured host.
-_UPSTREAM_BASE_URL: str = _resolve_upstream_base_url()
-_UPSTREAM_NETLOC: str = urlsplit(_UPSTREAM_BASE_URL).netloc
-
 _token_lock = asyncio.Lock()
 _token_totals: dict[str, int] = {
     "input_tokens": 0,
@@ -120,6 +115,12 @@ def _resolve_upstream_base_url() -> str:
         if candidate:
             return _normalize_base_url(candidate, error_label=env_name)
     raise RuntimeError("Proxy upstream base URL is not configured. Set PROXY_UPSTREAM_BASE_URL.")
+
+
+# Resolve upstream URL once at module load — never changes at runtime. Defined AFTER
+# the resolver so the module-level call is not a forward reference (was a NameError).
+_UPSTREAM_BASE_URL: str = _resolve_upstream_base_url()
+_UPSTREAM_NETLOC: str = urlsplit(_UPSTREAM_BASE_URL).netloc
 
 
 def _resolve_compression_base_url() -> str:

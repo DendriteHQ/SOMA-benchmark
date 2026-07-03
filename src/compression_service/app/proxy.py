@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import os
 import uuid
+import zlib
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
@@ -42,9 +44,34 @@ _token_totals: dict[str, int] = {
 TOKEN_USAGE_LOG_MARKER = "[proxy][token-usage] "
 
 
-def _extract_usage_from_response(response_body: bytes) -> dict | None:
+def _decompress_for_parsing(body: bytes, content_encoding: str) -> bytes:
+    """Best-effort decompression of `body` for local usage-extraction only.
+
+    Standalone runs talk to the upstream LLM directly (no gateway in between to
+    absorb `Content-Encoding` the way `SOMA/gateway`'s httpx client does), so a
+    compressed response body reaches us as-is. Never raises — a decode failure
+    falls back to the original bytes, which downstream json.loads() rejects the
+    same way it already does for any other unparseable payload.
+    """
+    encoding = (content_encoding or "").strip().lower()
     try:
-        data = json.loads(response_body)
+        if encoding == "gzip" or encoding == "x-gzip":
+            return gzip.decompress(body)
+        if encoding == "deflate":
+            try:
+                return zlib.decompress(body)
+            except zlib.error:
+                # Some servers send raw deflate without the zlib header.
+                return zlib.decompress(body, -zlib.MAX_WBITS)
+    except Exception:
+        return body
+    return body
+
+
+def _extract_usage_from_response(response_body: bytes, content_encoding: str = "") -> dict | None:
+    decoded_body = _decompress_for_parsing(response_body, content_encoding)
+    try:
+        data = json.loads(decoded_body)
     except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(data, dict):
@@ -340,7 +367,8 @@ async def proxy_passthrough(path: str, request: Request) -> Response:
             response_headers = _response_headers_from_upstream(list(upstream_response.headers.items()))
             content_type = upstream_response.headers.get("content-type", "")
             if "application/json" in content_type:
-                usage = _extract_usage_from_response(response_body)
+                content_encoding = upstream_response.headers.get("content-encoding", "")
+                usage = _extract_usage_from_response(response_body, content_encoding)
                 if usage:
                     await _accumulate_token_usage(usage)
             return Response(

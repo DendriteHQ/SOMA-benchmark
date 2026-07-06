@@ -52,6 +52,7 @@ source .env && uv run python -m soma_bench benchmark-solve \
   --agent-name openclaw \
   --benchmark SWE-bench/SWE-bench_Verified \
   --instance-id INSTANCE_ID \
+  --benchmark-type swebench_verified \
   --execute \
   --openclaw-plugin-path /path/to/plugin/SOMA-plugin \
   --openclaw-current-user \
@@ -59,6 +60,16 @@ source .env && uv run python -m soma_bench benchmark-solve \
   --openclaw-command "--timeout 3000"
   --swerebench-eval
 ```
+
+`--benchmark-type` selects which task mode the agent runs in. If omitted, it defaults to
+`swebench_verified`. Accepted values:
+
+- `swebench_verified` (default) — standard SWE-bench Verified solve mode: the agent gets the
+  issue's problem statement (and hints) and must produce a patch.
+- `swe_explorer_explore` — SWE-Explorer file exploration mode: the agent explores the repo and
+  outputs the regions it read, without producing a patch.
+- `swe_explorer_edit` — SWE-Explorer edit mode: the agent receives the ground-truth modified
+  files as a hint and must produce a patch.
 
 Run OpenClaw against an existing benchmark manifest:
 

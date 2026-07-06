@@ -45,7 +45,7 @@ COPILOT_DEFAULT_OUTPUT_FORMAT = "json"
 COPILOT_DEFAULT_RUN_ROOT_DIRNAME = "soma-benchmark-copilot-runs"
 COPILOT_DEFAULT_CLEANUP_REPO = True
 COPILOT_DEFAULT_COMPRESSION_AUTOBUILD = False
-COPILOT_DEFAULT_SHARED_PROXY_BATCH = True
+COPILOT_DEFAULT_SHARED_PROXY_BATCH = False
 COPILOT_DEFAULT_SHARED_PROXY_TEARDOWN = True
 
 
@@ -552,7 +552,7 @@ def _remove_workspace_volume(*, volume_name: str) -> None:
         )
 
 
-def _capture_workspace_patch(*, volume_name: str, tmp_run_dir: Path) -> dict[str, Any]:
+def _capture_workspace_patch(*, volume_name: str, tmp_run_dir: Path, base_commit: str | None = None) -> dict[str, Any]:
     patch_eval_dir = tmp_run_dir / "patch-eval"
     patch_eval_dir.mkdir(parents=True, exist_ok=True)
     patch_path = patch_eval_dir / "agent.patch"
@@ -592,7 +592,7 @@ def _capture_workspace_patch(*, volume_name: str, tmp_run_dir: Path) -> dict[str
             "size_bytes": 0,
         }
 
-    return capture_repo_patch(repo_dir=snapshot_dir, output_dir=patch_eval_dir)
+    return capture_repo_patch(repo_dir=snapshot_dir, output_dir=patch_eval_dir, base_ref=base_commit)
 
 
 def _run_command(
@@ -1486,6 +1486,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         patch_capture = _capture_workspace_patch(
             volume_name=workspace_volume,
             tmp_run_dir=tmp_run_dir,
+            base_commit=base_commit,
         )
         emit_progress(
             f"[{context.instance.instance_id}] patch capture status: {patch_capture.get('status')} changes={patch_capture.get('has_changes')}",

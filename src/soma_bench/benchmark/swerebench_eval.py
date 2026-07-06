@@ -237,9 +237,19 @@ def capture_repo_patch(
     *,
     repo_dir: Path,
     output_dir: Path,
+    base_ref: str | None = None,
 ) -> dict[str, Any]:
+    """Diff `repo_dir` against `base_ref` (defaults to HEAD).
+
+    Passing the instance's actual base_commit (instead of relying on HEAD) is
+    required whenever the agent might run `git commit` itself — a coding CLI
+    that commits its own work leaves the working tree clean relative to HEAD,
+    which would otherwise make a real, committed change look like no change
+    at all.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     patch_path = output_dir / "agent.patch"
+    diff_ref = base_ref or "HEAD"
     payload: dict[str, Any] = {
         "status": "skipped-no-git",
         "repo_dir": str(repo_dir),
@@ -270,7 +280,7 @@ def capture_repo_patch(
             "--binary",
             "--full-index",
             "--no-ext-diff",
-            "HEAD",
+            diff_ref,
             "--",
             ".",
             *(f":(exclude){path}" for path in OPENCLAW_PATCH_EXCLUDE_PATHS),

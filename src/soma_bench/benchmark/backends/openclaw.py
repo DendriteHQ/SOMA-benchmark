@@ -29,7 +29,7 @@ OPENCLAW_WORKSPACE_ERROR = (
     "Received workspace={workspace!r}."
 )
 
-OPENCLAW_GATEWAY_IMAGE = "alpine/openclaw:latest"
+OPENCLAW_GATEWAY_IMAGE = "alpine/openclaw:2026.6.1-alpha.1"
 OPENCLAW_GATEWAY_PORT = 18789
 OPENCLAW_GATEWAY_START_RETRIES = 20
 OPENCLAW_GATEWAY_START_SLEEP_SECONDS = 0.5
@@ -1579,6 +1579,35 @@ def _start_compression_service_in_dind(context: RuntimeExecutionContext) -> None
             f"Failed to start compression service in DinD: "
             f"{(result.stderr or result.stdout or '').strip()}"
         )
+
+    # Block miner code from accessing the DinD Docker API at 172.17.0.1:2375
+    ip_result = _run_isolated_docker_command(context, [
+        "inspect", "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        container_name,
+    ])
+    container_ip = (ip_result.stdout or "").strip()
+    if container_ip:
+        iptables_result = _run_command([
+            "docker", "exec", "--privileged",
+            _dind_container_name(context),
+            "iptables", "-I", "INPUT",
+            "-s", container_ip,
+            "-d", "172.17.0.1",
+            "-p", "tcp", "--dport", "2375",
+            "-j", "DROP",
+        ])
+        if iptables_result.returncode != 0:
+            emit_progress(
+                f"WARNING: failed to add iptables rule blocking miner Docker API access: "
+                f"{(iptables_result.stderr or iptables_result.stdout or '').strip()}",
+                component="openclaw",
+            )
+        else:
+            emit_progress(
+                f"Blocked miner container {container_name} (IP: {container_ip}) from accessing DinD Docker API",
+                component="openclaw",
+            )
 
 
 def _wait_for_compression_service_ready(context: RuntimeExecutionContext) -> None:

@@ -390,6 +390,7 @@ def normalize_runtime_setup_entry(row: dict[str, Any], *, benchmark_name: str) -
         "docker_image",
         "image_name",
         "license_name",
+        "ground_truth",
     ):
         value = row.get(key)
         if value is None:

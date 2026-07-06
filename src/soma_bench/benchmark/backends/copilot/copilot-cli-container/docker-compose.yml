@@ -1,0 +1,81 @@
+services:
+  copilot:
+    build: .
+    image: local/copilot-cli:latest
+    pull_policy: never
+    env_file:
+      - .env
+    working_dir: /workspace
+    volumes:
+      - copilot-workspace:/workspace
+      - copilot-home:/home/copilot
+    networks:
+      - copilot-sandbox
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    stdin_open: true
+    tty: true
+
+  proxy:
+    image: ${COPILOT_PROXY_IMAGE:-soma-compression-service:latest}
+    environment:
+      - PROXY_UPSTREAM_BASE_URL=${COMPACT_BENCH_LLM_BASE_URL}
+      - PROXY_COMPRESSION_BASE_URL=${PROXY_COMPRESSION_BASE_URL:-http://compression-service:8000/}
+      - PROXY_COMPRESSION_BASE_URL_TEMPLATE=${PROXY_COMPRESSION_BASE_URL_TEMPLATE:-}
+      - PROXY_COMPRESSION_ROUTE_MAP=${PROXY_COMPRESSION_ROUTE_MAP:-}
+      - PROXY_COMPRESSION_ENABLED=${PROXY_COMPRESSION_ENABLED:-true}
+      - PROXY_PROVIDER_API_KEY=${PROXY_PROVIDER_API_KEY:-}
+      - PROXY_RUN_ID_HEADER_VALUE=${PROXY_RUN_ID_HEADER_VALUE:-}
+      - PORT=${COPILOT_PROXY_PORT:-8080}
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - uvicorn
+      - app.proxy:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - ${COPILOT_PROXY_PORT:-8080}
+    networks:
+      - copilot-sandbox
+      - copilot-egress
+
+  compression-service:
+    image: ${COPILOT_COMPRESSION_SERVICE_IMAGE:-soma-compression-service:latest}
+    environment:
+      - MINER_MODULE_PATH=/app/miner/base_miner.py
+      - COMPRESSION_MUTATE_REQUEST=${COMPRESSION_MUTATE_REQUEST:-true}
+    volumes:
+      - ${COPILOT_COMPRESSION_SCRIPT_PATH:-/dev/null}:/app/miner/base_miner.py:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    profiles:
+      - copilot-sidecars
+    networks:
+      - copilot-sandbox
+
+  swe-sandbox:
+    image: ${COPILOT_SWE_SANDBOX_IMAGE:-alpine:3.20}
+    volumes:
+      - copilot-workspace:/testbed
+    command:
+      - /bin/sh
+      - -lc
+      - while true; do sleep 3600; done
+    profiles:
+      - copilot-sidecars
+    networks:
+      - copilot-sandbox
+
+volumes:
+  copilot-home:
+  copilot-workspace:
+    external: true
+    name: ${COPILOT_WORKSPACE_VOLUME_NAME}
+
+networks:
+  copilot-sandbox:
+    internal: true
+  copilot-egress:

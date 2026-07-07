@@ -1189,7 +1189,42 @@ def _write_logs(run_dir: Path, *, stdout: str, stderr: str, command: list[str], 
     }
 
 
+def _extract_stream_error(stdout: str) -> str | None:
+    """Scan Copilot's JSONL event stream for the actual failure reason.
+
+    docker compose's own stdout/stderr only ever contains provisioning noise
+    ("Volume X Created", "Container Y Created"); the real reason a run failed
+    (e.g. a 404 from the model provider) is emitted by the Copilot CLI as a
+    `session.error` / `model.call_failure` event on stdout.
+    """
+    session_error: str | None = None
+    call_failure: str | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        if event.get("type") == "session.error":
+            message = data.get("message")
+            if isinstance(message, str) and message.strip():
+                session_error = message.strip()
+        elif event.get("type") == "model.call_failure":
+            error_message = data.get("errorMessage")
+            if isinstance(error_message, str) and error_message.strip():
+                call_failure = error_message.strip()
+    return session_error or call_failure
+
+
 def _error_summary(stderr: str, stdout: str) -> str:
+    stream_error = _extract_stream_error(stdout)
+    if stream_error:
+        return " ".join(stream_error.split())[:400]
     for candidate in (stderr, stdout):
         normalized = " ".join(candidate.split())
         if normalized:

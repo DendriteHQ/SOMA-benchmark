@@ -269,6 +269,57 @@ def _response_headers_from_upstream(headers: list[tuple[str, str]]) -> dict[str,
     return payload
 
 
+# "developer" is the o-series alias for the system role in the OpenAI API.
+_PROTECTED_MESSAGE_ROLES = {"system", "developer", "user"}
+
+
+def _strip_protected_prompts(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Remove system and user prompts from `payload` before compression.
+
+    Returns (stripped_payload, protected). `protected` keeps the removed
+    messages with their original indices plus the top-level `system` field
+    (Anthropic-style payloads), so `_restore_protected_prompts` can put them
+    back after the compression service returns.
+    """
+    protected_messages: list[tuple[int, Any]] = []
+    remaining_messages: list[Any] = []
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for index, message in enumerate(messages):
+            role = message.get("role") if isinstance(message, dict) else None
+            if role in _PROTECTED_MESSAGE_ROLES:
+                protected_messages.append((index, message))
+            else:
+                remaining_messages.append(message)
+
+    stripped_payload = dict(payload)
+    if isinstance(messages, list):
+        stripped_payload["messages"] = remaining_messages
+    system_field = stripped_payload.pop("system", None)
+    protected = {"messages": protected_messages, "system": system_field}
+    return stripped_payload, protected
+
+
+def _restore_protected_prompts(payload: dict[str, Any], protected: dict[str, Any]) -> dict[str, Any]:
+    restored_payload = dict(payload)
+    messages = restored_payload.get("messages")
+    # Drop any protected-role messages the compressor injected — only the
+    # originals held by the proxy may carry these roles.
+    restored_messages = [
+        message
+        for message in (messages if isinstance(messages, list) else [])
+        if not (isinstance(message, dict) and message.get("role") in _PROTECTED_MESSAGE_ROLES)
+    ]
+    # Ascending original indices; clamp in case the compressor changed the count.
+    for index, message in protected["messages"]:
+        restored_messages.insert(min(index, len(restored_messages)), message)
+    if restored_messages or protected["messages"]:
+        restored_payload["messages"] = restored_messages
+    if protected["system"] is not None:
+        restored_payload["system"] = protected["system"]
+    return restored_payload
+
+
 def _transform_payload_via_compression_service(
     *,
     path: str,
@@ -338,13 +389,15 @@ async def proxy_passthrough(path: str, request: Request) -> Response:
             parsed_payload = None
 
         if isinstance(parsed_payload, dict):
+            stripped_payload, protected_prompts = _strip_protected_prompts(parsed_payload)
             transformed_payload = _transform_payload_via_compression_service(
                 path=path,
                 query=request.url.query,
-                payload=parsed_payload,
+                payload=stripped_payload,
                 request_id=request_id,
                 compression_base_url=compression_base_url,
             )
+            transformed_payload = _restore_protected_prompts(transformed_payload, protected_prompts)
             forwarded_body = json.dumps(transformed_payload, ensure_ascii=False).encode("utf-8")
 
     forwarded_headers = _forwardable_headers(request)

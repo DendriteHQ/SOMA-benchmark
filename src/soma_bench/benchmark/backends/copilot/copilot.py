@@ -8,6 +8,7 @@ import subprocess
 import hashlib
 import tempfile
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -47,6 +48,12 @@ COPILOT_DEFAULT_CLEANUP_REPO = True
 COPILOT_DEFAULT_COMPRESSION_AUTOBUILD = False
 COPILOT_DEFAULT_SHARED_PROXY_BATCH = False
 COPILOT_DEFAULT_SHARED_PROXY_TEARDOWN = True
+COPILOT_DEFAULT_RUN_RETENTION_SECONDS = 24 * 60 * 60
+COPILOT_DEFAULT_RUN_CLEANUP_INTERVAL_SECONDS = 5 * 60
+COPILOT_DEFAULT_PRESERVE_RUN_DIRS = False
+
+_run_root_cleanup_lock = threading.Lock()
+_last_run_root_cleanup_monotonic = 0.0
 
 
 def _resolve_runtime_options(context: RuntimeExecutionContext) -> dict[str, Any]:
@@ -156,6 +163,88 @@ def _resolve_cleanup_repo_enabled(context: RuntimeExecutionContext) -> bool:
         if option is not None:
             return option
     return COPILOT_DEFAULT_CLEANUP_REPO
+
+
+def _coerce_positive_int_option(raw_value: Any, default: int) -> int:
+    try:
+        parsed = int(str(raw_value).strip())
+    except (TypeError, ValueError, AttributeError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _resolve_preserve_run_dirs_enabled(context: RuntimeExecutionContext) -> bool:
+    for value in (
+        os.getenv("SOMA_COPILOT_PRESERVE_RUN_DIRS"),
+        _resolve_runtime_option(context, "copilot_preserve_run_dirs"),
+    ):
+        option = _coerce_bool_option(value)
+        if option is not None:
+            return option
+    return COPILOT_DEFAULT_PRESERVE_RUN_DIRS
+
+
+def _resolve_run_retention_seconds(context: RuntimeExecutionContext) -> int:
+    return _coerce_positive_int_option(
+        _resolve_runtime_option(context, "copilot_run_retention_seconds")
+        or os.getenv("SOMA_COPILOT_RUN_RETENTION_SECONDS"),
+        COPILOT_DEFAULT_RUN_RETENTION_SECONDS,
+    )
+
+
+def _resolve_run_cleanup_interval_seconds(context: RuntimeExecutionContext) -> int:
+    return _coerce_positive_int_option(
+        _resolve_runtime_option(context, "copilot_run_cleanup_interval_seconds")
+        or os.getenv("SOMA_COPILOT_RUN_CLEANUP_INTERVAL_SECONDS"),
+        COPILOT_DEFAULT_RUN_CLEANUP_INTERVAL_SECONDS,
+    )
+
+
+def _maybe_cleanup_stale_run_dirs(context: RuntimeExecutionContext, *, base_root: Path) -> None:
+    """Remove old ``run-*`` directories left behind under ``base_root``.
+
+    Each run persists a full workspace snapshot (patch-eval/workspace-snapshot) that is
+    never otherwise deleted, so left unattended this directory grows without bound.
+    Mirrors the retention-based sweep sandbox_service already runs for its own output root.
+    """
+    if _resolve_preserve_run_dirs_enabled(context):
+        return
+
+    retention_seconds = _resolve_run_retention_seconds(context)
+    cleanup_interval_seconds = _resolve_run_cleanup_interval_seconds(context)
+
+    global _last_run_root_cleanup_monotonic
+    now_monotonic = time.monotonic()
+    with _run_root_cleanup_lock:
+        if now_monotonic - _last_run_root_cleanup_monotonic < cleanup_interval_seconds:
+            return
+        _last_run_root_cleanup_monotonic = now_monotonic
+
+    if not base_root.is_dir():
+        return
+
+    cutoff_epoch = time.time() - retention_seconds
+    removed_count = 0
+    for candidate in base_root.iterdir():
+        if not candidate.name.startswith("run-") or not candidate.is_dir():
+            continue
+        try:
+            modified_epoch = candidate.stat().st_mtime
+        except OSError:
+            continue
+        if modified_epoch >= cutoff_epoch:
+            continue
+        shutil.rmtree(candidate, ignore_errors=True)
+        if not candidate.exists():
+            removed_count += 1
+
+    if removed_count > 0:
+        emit_progress(
+            f"[copilot] removed {removed_count} stale run director"
+            f"{'y' if removed_count == 1 else 'ies'} under {base_root} "
+            f"(retention_seconds={retention_seconds})",
+            component="copilot",
+        )
 
 
 def _resolve_proxy_service(context: RuntimeExecutionContext) -> str:
@@ -808,6 +897,8 @@ def _resolve_run_root(context: RuntimeExecutionContext) -> Path:
         base_root = Path(override.strip()).expanduser().resolve()
     else:
         base_root = (Path(tempfile.gettempdir()) / COPILOT_DEFAULT_RUN_ROOT_DIRNAME).resolve()
+
+    _maybe_cleanup_stale_run_dirs(context, base_root=base_root)
 
     run_id = _resolve_execution_run_id(context)
     return base_root / f"run-{run_id}"

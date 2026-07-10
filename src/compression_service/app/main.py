@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import inspect
+import io
 import json
 import os
 import sys
+import threading
+import time
+import traceback
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
@@ -62,6 +67,37 @@ def _emit_message_event(*, request_id: str, stage: str, path: str, query: str, p
         "messages": _extract_messages(payload),
     }
     print(f"{marker} {json.dumps(entry, ensure_ascii=False)}", flush=True)
+
+
+_COMPRESSOR_EXEC_MARKER = "[compression-service][compressor.exec]"
+# Serializes compressor invocations so per-invocation stdout/stderr capture does not
+# interleave between concurrent /transform requests (handler runs in a threadpool).
+_COMPRESSOR_EXEC_LOCK = threading.Lock()
+
+
+def _get_compressor_output_capture_limit() -> int:
+    raw = os.getenv("COMPRESSOR_EXEC_OUTPUT_CAPTURE_LIMIT_CHARS", "20000").strip()
+    try:
+        limit = int(raw)
+    except ValueError:
+        limit = 20000
+    return max(0, limit)
+
+
+def _truncate_captured_output(value: str) -> str:
+    limit = _get_compressor_output_capture_limit()
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}\n... [truncated {len(value) - limit} chars]"
+
+
+def _emit_compressor_exec_event(entry: dict[str, Any]) -> None:
+    """Emit one JSON line per compressor invocation to container stdout.
+
+    These lines are picked out of the collected container log by the sandbox
+    service and uploaded to S3 as the run's compressor execution log.
+    """
+    print(f"{_COMPRESSOR_EXEC_MARKER} {json.dumps(entry, ensure_ascii=False)}", flush=True)
 
 
 def _load_compressor_module() -> ModuleType | None:
@@ -140,6 +176,55 @@ def _invoke_compressor(payload: dict[str, Any], *, path: str) -> dict[str, Any]:
     return payload
 
 
+def _invoke_compressor_logged(
+    payload: dict[str, Any],
+    *,
+    path: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """Invoke the miner compressor and emit a per-invocation execution log event.
+
+    Captures everything the miner module writes to stdout/stderr during the call,
+    together with timing and failure details, and emits it as a single marked JSON
+    line so the sandbox service can extract and persist it per run.
+    """
+    input_messages = _extract_messages(payload)
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    started = time.monotonic()
+    error: Exception | None = None
+    error_traceback: str | None = None
+    result: dict[str, Any] | None = None
+    with _COMPRESSOR_EXEC_LOCK:
+        try:
+            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+                result = _invoke_compressor(payload, path=path)
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+            error_traceback = traceback.format_exc()
+    duration_ms = round((time.monotonic() - started) * 1000.0, 3)
+
+    _emit_compressor_exec_event(
+        {
+            "request_id": request_id,
+            "path": path,
+            "ok": error is None,
+            "compressor_loaded": _COMPRESSOR_FN is not None,
+            "duration_ms": duration_ms,
+            "input_messages": len(input_messages),
+            "output_messages": len(_extract_messages(result)) if isinstance(result, dict) else None,
+            "stdout": _truncate_captured_output(stdout_buffer.getvalue()),
+            "stderr": _truncate_captured_output(stderr_buffer.getvalue()),
+            "error": f"{type(error).__name__}: {error}" if error is not None else None,
+            "traceback": error_traceback,
+        }
+    )
+
+    if error is not None:
+        raise HTTPException(status_code=500, detail=f"compressor error: {error}") from error
+    return result
+
+
 @app.get("/health")
 def health() -> JSONResponse:
     return JSONResponse(
@@ -166,10 +251,11 @@ def transform_payload(request: TransformRequest) -> TransformResponse:
         payload=request.payload,
     )
 
-    try:
-        transformed = _invoke_compressor(request.payload, path=request.path)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"compressor error: {exc}") from exc
+    transformed = _invoke_compressor_logged(
+        request.payload,
+        path=request.path,
+        request_id=request_id,
+    )
 
     if not isinstance(transformed, dict):
         raise HTTPException(status_code=500, detail="compressor returned unsupported payload type")

@@ -270,11 +270,15 @@ def _response_headers_from_upstream(headers: list[tuple[str, str]]) -> dict[str,
 
 
 # "developer" is the o-series alias for the system role in the OpenAI API.
-_PROTECTED_MESSAGE_ROLES = {"system", "developer", "user"}
+_PROTECTED_MESSAGE_ROLES = {"system", "developer"}
 
 
 def _strip_protected_prompts(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Remove system and user prompts from `payload` before compression.
+    """Remove system prompts and the first user prompt from `payload` before compression.
+
+    Every system/developer message is protected, but only the first user
+    message in the trajectory is — later user-role messages (e.g. injected
+    loop-detection notices) must stay visible to the compressor.
 
     Returns (stripped_payload, protected). `protected` keeps the removed
     messages with their original indices plus the top-level `system` field
@@ -283,11 +287,15 @@ def _strip_protected_prompts(payload: dict[str, Any]) -> tuple[dict[str, Any], d
     """
     protected_messages: list[tuple[int, Any]] = []
     remaining_messages: list[Any] = []
+    first_user_protected = False
     messages = payload.get("messages")
     if isinstance(messages, list):
         for index, message in enumerate(messages):
             role = message.get("role") if isinstance(message, dict) else None
             if role in _PROTECTED_MESSAGE_ROLES:
+                protected_messages.append((index, message))
+            elif role == "user" and not first_user_protected:
+                first_user_protected = True
                 protected_messages.append((index, message))
             else:
                 remaining_messages.append(message)
@@ -303,8 +311,10 @@ def _strip_protected_prompts(payload: dict[str, Any]) -> tuple[dict[str, Any], d
 def _restore_protected_prompts(payload: dict[str, Any], protected: dict[str, Any]) -> dict[str, Any]:
     restored_payload = dict(payload)
     messages = restored_payload.get("messages")
-    # Drop any protected-role messages the compressor injected — only the
-    # originals held by the proxy may carry these roles.
+    # Drop any system/developer messages the compressor injected — only the
+    # originals held by the proxy may carry these roles. User-role messages
+    # pass through: apart from the protected first one, they legitimately
+    # flow through compression (e.g. loop-detection notices).
     restored_messages = [
         message
         for message in (messages if isinstance(messages, list) else [])

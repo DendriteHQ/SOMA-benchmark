@@ -173,6 +173,22 @@ def _coerce_positive_int_option(raw_value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _resolve_agent_timeout_seconds(context: RuntimeExecutionContext) -> float | None:
+    for value in (
+        os.getenv("SOMA_COPILOT_AGENT_TIMEOUT_SECONDS"),
+        _resolve_runtime_option(context, "copilot_agent_timeout_seconds"),
+    ):
+        if value is None:
+            continue
+        try:
+            parsed = float(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
 def _resolve_preserve_run_dirs_enabled(context: RuntimeExecutionContext) -> bool:
     for value in (
         os.getenv("SOMA_COPILOT_PRESERVE_RUN_DIRS"),
@@ -1012,7 +1028,8 @@ def _run_copilot_command_streaming(
     env: dict[str, str],
     trajectory_path: Path | None,
     stream_log_path: Path | None,
-) -> subprocess.CompletedProcess[str]:
+    timeout_seconds: float | None = None,
+) -> tuple[subprocess.CompletedProcess[str], bool]:
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
     trajectory_handle: Any = None
@@ -1075,6 +1092,19 @@ def _run_copilot_command_streaming(
         )
         stdout_thread.start()
         stderr_thread.start()
+
+        timed_out = False
+        if timeout_seconds is not None:
+            try:
+                process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                process.terminate()
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
         stdout_thread.join()
         stderr_thread.join()
 
@@ -1088,7 +1118,7 @@ def _run_copilot_command_streaming(
             returncode=returncode,
             stdout=stdout_text,
             stderr="".join(stderr_chunks),
-        )
+        ), timed_out
     finally:
         if trajectory_handle is not None:
             trajectory_handle.close()
@@ -1344,6 +1374,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     network_isolation = _resolve_network_isolation_enabled(context)
     keep_stack = _resolve_keep_compose_stack(context)
     cleanup_repo = _resolve_cleanup_repo_enabled(context)
+    agent_timeout_seconds = _resolve_agent_timeout_seconds(context)
     proxy_service = _resolve_proxy_service(context)
     proxy_port = _resolve_proxy_port(context, proxy_service=proxy_service)
     compose_project = _resolve_compose_project_name(context)
@@ -1581,13 +1612,20 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             live_trajectory_path = benchmark_trajectory_path
         live_stream_log_path = tmp_run_dir / "copilot-stream.log"
 
-        result = _run_copilot_command_streaming(
+        result, agent_timed_out = _run_copilot_command_streaming(
             command=command,
             cwd=repo_root,
             env=env,
             trajectory_path=live_trajectory_path,
             stream_log_path=live_stream_log_path,
+            timeout_seconds=agent_timeout_seconds,
         )
+        if agent_timed_out:
+            emit_progress(
+                f"[{context.instance.instance_id}] Copilot execution timed out after "
+                f"{agent_timeout_seconds:.0f}s; collecting token usage, skipping patch capture",
+                component="copilot",
+            )
 
         trajectory_path = live_trajectory_path
         if trajectory_path is None:
@@ -1605,19 +1643,20 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 component="copilot",
             )
             agent_steps = _count_trajectory_steps(trajectory_path)
-        emit_progress(
-            f"[{context.instance.instance_id}] capturing repository patch from workspace volume",
-            component="copilot",
-        )
-        patch_capture = _capture_workspace_patch(
-            volume_name=workspace_volume,
-            tmp_run_dir=tmp_run_dir,
-            base_commit=base_commit,
-        )
-        emit_progress(
-            f"[{context.instance.instance_id}] patch capture status: {patch_capture.get('status')} changes={patch_capture.get('has_changes')}",
-            component="copilot",
-        )
+        if not agent_timed_out:
+            emit_progress(
+                f"[{context.instance.instance_id}] capturing repository patch from workspace volume",
+                component="copilot",
+            )
+            patch_capture = _capture_workspace_patch(
+                volume_name=workspace_volume,
+                tmp_run_dir=tmp_run_dir,
+                base_commit=base_commit,
+            )
+            emit_progress(
+                f"[{context.instance.instance_id}] patch capture status: {patch_capture.get('status')} changes={patch_capture.get('has_changes')}",
+                component="copilot",
+            )
     finally:
         if stack_up_attempted:
             sidecar_services = [service_name for service_name in {proxy_service, COPILOT_DEFAULT_PROXY_SERVICE, "compression-service"}]
@@ -1703,12 +1742,24 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "trajectory_path": str(trajectory_path) if trajectory_path is not None else "",
         "stream_log_path": str((tmp_run_dir / "copilot-stream.log").resolve()),
         "agent_steps": agent_steps,
+        "agent_timeout_seconds": agent_timeout_seconds,
+        "agent_timed_out": agent_timed_out,
         "patch_capture": patch_capture,
         "token_usage": proxy_token_usage,
         **sidecar_log_paths,
         **message_request_log_paths,
         **log_paths,
     }
+
+    if agent_timed_out:
+        return RuntimeExecutionResult(
+            benchmark_id=context.instance.benchmark_id,
+            instance_id=context.instance.instance_id,
+            backend_name=context.backend_name,
+            status="timeout",
+            error=f"Copilot execution timed out after {agent_timeout_seconds:.0f} seconds",
+            metadata=metadata,
+        )
 
     if result.returncode == 0:
         return RuntimeExecutionResult(

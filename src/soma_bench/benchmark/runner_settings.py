@@ -194,9 +194,9 @@ def resolve_benchmark_runtime_setup(
     dataset_info = _load_cached_dataset_info(benchmark_name)
     if dataset_info is None:
         dataset_info = _load_dataset_info_from_local_hf_cache(benchmark_name)
-    if dataset_info is None:
-        dataset_info = _request_dataset_viewer_json("info", {"dataset": benchmark_name})
-    _write_cached_dataset_info(benchmark_name, dataset_info)
+        if dataset_info is None:
+            dataset_info = _request_dataset_viewer_json("info", {"dataset": benchmark_name})
+        _write_cached_dataset_info(benchmark_name, dataset_info)
     dataset_configs = dataset_info.get("dataset_info")
     if not isinstance(dataset_configs, dict) or not dataset_configs:
         raise BenchmarkRunnerSettingsError(f"Could not resolve dataset info for benchmark: {benchmark_name}")
@@ -499,7 +499,13 @@ def _load_cached_dataset_info(benchmark_name: str) -> dict[str, Any] | None:
 def _write_cached_dataset_info(benchmark_name: str, payload: dict[str, Any]) -> None:
     cache_path = _dataset_info_cache_path(benchmark_name)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _write_json_object_atomic(cache_path, payload)
+
+
+def _write_json_object_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temp_path = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+    temp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temp_path.replace(path)
 
 
 def _cache_refresh_enabled() -> bool:
@@ -563,7 +569,7 @@ def _ensure_cached_dataset_split(
     cache_dir = _dataset_split_cache_dir(benchmark_name, dataset_config, split)
     rows_path = _dataset_split_rows_cache_path(benchmark_name, dataset_config, split)
     meta_path = _dataset_split_meta_cache_path(benchmark_name, dataset_config, split)
-    temp_rows_path = rows_path.with_suffix(".jsonl.tmp")
+    temp_rows_path = rows_path.with_suffix(f".jsonl.{os.getpid()}.tmp")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -614,7 +620,7 @@ def _ensure_cached_dataset_split(
         "cached_at": int(time.time()),
     }
     temp_rows_path.replace(rows_path)
-    meta_path.write_text(json.dumps(meta_payload, indent=2) + "\n", encoding="utf-8")
+    _write_json_object_atomic(meta_path, meta_payload)
 
 
 def _resolve_cached_dataset_row(
@@ -725,7 +731,7 @@ def _write_dataset_split_cache_from_local_hf_cache(
     except Exception:
         return False
 
-    temp_rows_path = rows_path.with_suffix(".jsonl.tmp")
+    temp_rows_path = rows_path.with_suffix(f".jsonl.{os.getpid()}.tmp")
     row_count = 0
     with temp_rows_path.open("w", encoding="utf-8") as handle:
         for row in dataset:
@@ -745,7 +751,7 @@ def _write_dataset_split_cache_from_local_hf_cache(
         "source": "local-hf-datasets-cache",
     }
     temp_rows_path.replace(rows_path)
-    meta_path.write_text(json.dumps(meta_payload, indent=2) + "\n", encoding="utf-8")
+    _write_json_object_atomic(meta_path, meta_payload)
     return True
 
 

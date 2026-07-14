@@ -301,6 +301,20 @@ def _resolve_dataset_row(
             if isinstance(row_wrapper, dict) and isinstance(row_wrapper.get("row"), dict):
                 return row_wrapper
     except BenchmarkRunnerSettingsError as exc:
+        # The datasets-server viewer API (filter/rows) is a separate, fragile
+        # service that returns 5xx/429 under load. Before giving up, try to
+        # resolve the row from the local HF datasets cache (the robust
+        # load_dataset path SWE-bench relies on).
+        local_row = _resolve_row_via_local_hf_cache(
+            benchmark_name=benchmark_name,
+            dataset_config=dataset_config,
+            split=split,
+            lookup_field=lookup_field,
+            selection_id=selection_id,
+            split_row_count=split_row_count,
+        )
+        if local_row is not None:
+            return local_row
         if "dataset index is loading" not in str(exc).lower():
             raise
 
@@ -311,6 +325,42 @@ def _resolve_dataset_row(
         lookup_field=lookup_field,
         selection_id=selection_id,
         split_row_count=split_row_count,
+    )
+
+
+def _resolve_row_via_local_hf_cache(
+    *,
+    benchmark_name: str,
+    dataset_config: str,
+    split: str,
+    lookup_field: str,
+    selection_id: str,
+    split_row_count: int,
+) -> dict[str, Any] | None:
+    """Resolve a single row from the local HF ``datasets`` cache.
+
+    Populates the split cache via ``load_dataset`` (offline, local files only)
+    and then looks the row up from it. Returns ``None`` when the dataset is not
+    present in the local HF cache or the row cannot be found, letting callers
+    fall back to their next strategy.
+    """
+    rows_path = _dataset_split_rows_cache_path(benchmark_name, dataset_config, split)
+    meta_path = _dataset_split_meta_cache_path(benchmark_name, dataset_config, split)
+    if not _write_dataset_split_cache_from_local_hf_cache(
+        benchmark_name=benchmark_name,
+        dataset_config=dataset_config,
+        split=split,
+        rows_path=rows_path,
+        meta_path=meta_path,
+        expected_row_count=split_row_count,
+    ):
+        return None
+    return _resolve_cached_dataset_row(
+        benchmark_name=benchmark_name,
+        dataset_config=dataset_config,
+        split=split,
+        lookup_field=lookup_field,
+        selection_id=selection_id,
     )
 
 
@@ -445,8 +495,12 @@ def _request_dataset_viewer_json(endpoint: str, params: dict[str, Any]) -> dict[
             break
         except error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
-            is_loading_error = exc.code >= 500 and "dataset index is loading" in details.lower()
-            if is_loading_error and attempt < max_attempts:
+            # Retry on transient server-side conditions: any 5xx (e.g. 503
+            # Service Temporarily Unavailable, or the dataset index still
+            # loading) and 429 rate-limits. Genuine client errors (404, etc.)
+            # are not retried.
+            is_transient = exc.code >= 500 or exc.code == 429
+            if is_transient and attempt < max_attempts:
                 time.sleep(min(attempt, 3))
                 last_error = exc
                 continue

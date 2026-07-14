@@ -225,12 +225,20 @@ def resolve_benchmark_runtime_setup(
             f"Benchmark dataset {benchmark_name} does not expose an '{lookup_field}' field needed by the runner"
         )
     where = f'"{lookup_field}"={_sql_string_literal(selection_id)}'
-    _ensure_cached_dataset_split(
-        benchmark_name=benchmark_name,
-        dataset_config=dataset_config,
-        split=split,
-        split_row_count=_extract_split_row_count(split_payload.get(split)),
-    )
+    split_row_count = _extract_split_row_count(split_payload.get(split))
+
+    # Resolving a single instance only needs the one targeted lookup below.
+    # Prefetching the whole split costs one datasets-server request per 100 rows,
+    # which trips the viewer rate limit on large datasets (SWE-rebench-V2 has
+    # ~32k rows -> ~321 requests -> HTTP 429). Opt in explicitly when the full
+    # offline split cache is actually wanted.
+    if _coerce_bool(os.getenv("SOMA_BENCHMARK_PREFETCH_SPLIT"), False):
+        _ensure_cached_dataset_split(
+            benchmark_name=benchmark_name,
+            dataset_config=dataset_config,
+            split=split,
+            split_row_count=split_row_count,
+        )
 
     row_wrapper = _resolve_dataset_row(
         benchmark_name=benchmark_name,
@@ -238,8 +246,18 @@ def resolve_benchmark_runtime_setup(
         split=split,
         lookup_field=lookup_field,
         selection_id=selection_id,
-        split_row_count=_extract_split_row_count(split_payload.get(split)),
+        split_row_count=split_row_count,
         filter_where=where,
+    )
+
+    # Persist just the resolved row into the split cache so consumers that scan
+    # rows.jsonl (e.g. the SWE-rebench eval harness) find it without a full
+    # prefetch. Idempotent; no-op when the row is already cached.
+    _cache_resolved_dataset_row(
+        benchmark_name=benchmark_name,
+        dataset_config=dataset_config,
+        split=split,
+        row_wrapper=row_wrapper,
     )
 
     return dataset_config, split, normalize_runtime_setup_entry(row_wrapper["row"], benchmark_name=benchmark_name)
@@ -390,6 +408,11 @@ def normalize_runtime_setup_entry(row: dict[str, Any], *, benchmark_name: str) -
         "docker_image",
         "image_name",
         "license_name",
+        # SWE-rebench-V2 content fields (absent in V1); kept verbatim so V2 rows
+        # are fully represented instead of silently dropped.
+        "pr_description",
+        "interface",
+        "language",
         "ground_truth",
     ):
         value = row.get(key)
@@ -621,6 +644,54 @@ def _ensure_cached_dataset_split(
     }
     temp_rows_path.replace(rows_path)
     _write_json_object_atomic(meta_path, meta_payload)
+
+
+def _cache_resolved_dataset_row(
+    *,
+    benchmark_name: str,
+    dataset_config: str,
+    split: str,
+    row_wrapper: dict[str, Any],
+) -> None:
+    """Append a single resolved row to the split rows cache.
+
+    Lets consumers that scan ``rows.jsonl`` (e.g. the SWE-rebench eval harness)
+    find the instance without prefetching the whole split. Idempotent: skips
+    when a row with the same instance_id is already cached.
+    """
+    if not isinstance(row_wrapper, dict):
+        return
+    row = row_wrapper.get("row")
+    if not isinstance(row, dict):
+        return
+    instance_id = row.get("instance_id")
+    if not isinstance(instance_id, str) or not instance_id.strip():
+        return
+
+    rows_path = _dataset_split_rows_cache_path(benchmark_name, dataset_config, split)
+    if rows_path.is_file():
+        try:
+            with rows_path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        existing = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    existing_row = existing.get("row") if isinstance(existing, dict) else None
+                    if isinstance(existing_row, dict) and existing_row.get("instance_id") == instance_id:
+                        return
+        except OSError:
+            pass
+
+    try:
+        rows_path.parent.mkdir(parents=True, exist_ok=True)
+        with rows_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"row": row}, ensure_ascii=True) + "\n")
+    except OSError:
+        pass
 
 
 def _resolve_cached_dataset_row(

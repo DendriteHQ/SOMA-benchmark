@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from ..base import RuntimeBackend, RuntimeExecutionContext, RuntimeExecutionResult
-from ...swerebench_eval import capture_repo_patch
+from ...swerebench_eval import capture_repo_patch, maybe_run_swerebench_evaluation
 from ...progress import emit_progress
 
 COPILOT_WORKSPACE_ERROR = (
@@ -1698,6 +1698,27 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         command=command,
         prompt=prompt,
     )
+    # Run SWE-rebench evaluation on the captured patch (parity with the OpenClaw
+    # backend). The call is internally gated: it no-ops unless --swerebench-eval
+    # is set and a non-empty patch was captured. SWE-rebench-V2 datasets are routed
+    # to the official evaluator inside maybe_run_swerebench_evaluation.
+    emit_progress(
+        f"[{context.instance.instance_id}] starting SWE-rebench patch evaluation",
+        component="copilot",
+    )
+    patch_evaluation = maybe_run_swerebench_evaluation(
+        instance_id=context.instance.instance_id,
+        benchmark_name=str(context.instance.hidden_eval.get("benchmark", "")).strip() or context.instance.repo,
+        split=str(_resolve_runtime_options(context).get("swerebench_split") or "test").strip() or "test",
+        model_name=str(context.llm_config.get("model") or context.backend_name or "unknown-model"),
+        patch_capture=patch_capture,
+        output_dir=tmp_run_dir / "patch-eval",
+        runtime_options=_resolve_runtime_options(context),
+    )
+    emit_progress(
+        f"[{context.instance.instance_id}] SWE-rebench patch evaluation status: {patch_evaluation.get('status', 'unknown')}",
+        component="copilot",
+    )
     metadata = {
         "compose_file": str(compose_file),
         "service": service,
@@ -1745,6 +1766,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "agent_timeout_seconds": agent_timeout_seconds,
         "agent_timed_out": agent_timed_out,
         "patch_capture": patch_capture,
+        "patch_evaluation": patch_evaluation,
         "token_usage": proxy_token_usage,
         **sidecar_log_paths,
         **message_request_log_paths,

@@ -301,6 +301,186 @@ def capture_repo_patch(
     return payload
 
 
+def _load_cached_row(instance_id: str, benchmark_name: str, split: str) -> dict[str, Any] | None:
+    """Return the raw dataset row for ``instance_id`` from the local benchmark cache."""
+    splits_root = _benchmark_cache_root() / _cache_slug(benchmark_name) / "splits"
+    if not splits_root.is_dir():
+        return None
+    split_dir_name = _cache_slug(split)
+    for config_dir in sorted(path for path in splits_root.iterdir() if path.is_dir()):
+        rows_path = config_dir / split_dir_name / "rows.jsonl"
+        if not rows_path.is_file():
+            continue
+        with rows_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    wrapper = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                row = _extract_cached_row(wrapper)
+                if isinstance(row, dict) and str(row.get("instance_id", "")).strip() == instance_id:
+                    return row
+    return None
+
+
+def _v2_report_summary(spec: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    """Normalize an official SWE-rebench-V2 report item into the SOMA summary shape."""
+    fail_to_pass_expected = spec.get("FAIL_TO_PASS") or []
+    pass_to_pass_expected = spec.get("PASS_TO_PASS") or []
+    from_fail_to_pass = list(item.get("from_fail_to_pass") or [])
+    failed_from_pass_to_pass = list(item.get("failed_from_pass_to_pass") or [])
+    p2p_total = len(pass_to_pass_expected)
+    p2p_failure = len(failed_from_pass_to_pass)
+    return {
+        "resolved": bool(item.get("passed_match", False)),
+        "fail_to_pass": {
+            "success": len(from_fail_to_pass),
+            "total": len(fail_to_pass_expected),
+            "success_tests": sorted(from_fail_to_pass),
+        },
+        "pass_to_pass": {
+            "success": max(p2p_total - p2p_failure, 0),
+            "total": p2p_total,
+            "failure_tests": sorted(failed_from_pass_to_pass),
+        },
+        "exit_code": item.get("exit_code"),
+        "log_path": item.get("log_path"),
+    }
+
+
+def run_swerebench_v2_evaluation(
+    *,
+    instance_id: str,
+    benchmark_name: str,
+    split: str,
+    model_name: str,
+    patch_capture: dict[str, Any],
+    output_dir: Path,
+    v2_root: Path,
+    runtime_options: dict[str, Any],
+) -> dict[str, Any]:
+    """Evaluate a captured patch with the official SWE-rebench-V2 ``scripts/eval.py``.
+
+    Unlike the SWE-bench harness path, this evaluator natively understands the
+    V2 instance schema (prebuilt ``image_name``, ``install_config.log_parser``,
+    no conda ``python`` spec) and ships all V2 log parsers.
+    """
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    base_result: dict[str, Any] = {
+        "evaluator": "swe-rebench-v2",
+        "dataset_name": benchmark_name,
+        "split": split,
+        "v2_root": str(v2_root),
+    }
+
+    eval_script = v2_root / "scripts" / "eval.py"
+    if not eval_script.is_file():
+        return {**base_result, "status": "unavailable", "reason": f"eval.py not found under {v2_root}"}
+
+    spec = _load_cached_row(instance_id, benchmark_name, split)
+    if spec is None:
+        return {
+            **base_result,
+            "status": "unavailable",
+            "reason": f"instance {instance_id} not found in local benchmark cache",
+        }
+
+    try:
+        patch_text = Path(str(patch_capture["patch_path"])).read_text(encoding="utf-8")
+    except (KeyError, OSError) as exc:
+        return {**base_result, "status": "error", "reason": f"could not read captured patch: {exc}"}
+
+    specs_path = output_dir / "v2-instances.json"
+    patches_path = output_dir / "v2-patches.json"
+    report_path = output_dir / "v2-eval-report.json"
+    specs_path.write_text(json.dumps([spec], ensure_ascii=True), encoding="utf-8")
+    patches_path.write_text(
+        json.dumps([{"instance_id": instance_id, "patch": patch_text}], ensure_ascii=True),
+        encoding="utf-8",
+    )
+
+    harness_python_value = _resolve_option(
+        runtime_options, "swerebench_harness_python", "SOMA_SWEREBENCH_HARNESS_PYTHON"
+    )
+    harness_python = str(harness_python_value).strip() if harness_python_value else sys.executable
+    max_workers = _coerce_positive_int(
+        _resolve_option(runtime_options, "swerebench_max_workers", "SOMA_SWEREBENCH_MAX_WORKERS"),
+        DEFAULT_MAX_WORKERS,
+    )
+
+    command = [
+        harness_python,
+        str(eval_script),
+        "--json",
+        str(specs_path),
+        "--patches",
+        str(patches_path),
+        "--instance-ids",
+        instance_id,
+        "--report-json",
+        str(report_path),
+        "--max-workers",
+        str(max_workers),
+    ]
+    emit_progress(
+        f"[{instance_id}] launching SWE-rebench-V2 evaluator ({eval_script})",
+        component="swerebench-eval",
+    )
+    result = _run_command_streaming(command, cwd=output_dir, env=os.environ.copy(), component="swerebench-eval")
+    (output_dir / "v2-eval.stdout.log").write_text(result.stdout or "", encoding="utf-8")
+
+    payload: dict[str, Any] = {
+        **base_result,
+        "status": "error",
+        "work_dir": str(output_dir),
+        "command": command,
+        "exit_code": result.returncode,
+        "report_path": str(report_path),
+        "instances_path": str(specs_path),
+        "patches_path": str(patches_path),
+    }
+
+    item: dict[str, Any] | None = None
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            report = None
+        items = report.get("items") if isinstance(report, dict) else None
+        if isinstance(items, list):
+            for entry in items:
+                if isinstance(entry, dict) and entry.get("instance_id") == instance_id:
+                    item = entry
+                    break
+
+    if item is not None:
+        payload["report"] = item
+        item_error = str(item.get("error") or "").strip()
+        if item_error:
+            payload["status"] = "error"
+            payload["error"] = item_error
+        else:
+            # A non-resolving patch is a *completed* eval, not a failure; eval.py
+            # only exits non-zero to signal "not all_ok", which we read from the report.
+            payload["status"] = "completed"
+            payload["summary"] = _v2_report_summary(spec, item)
+            payload["resolved"] = payload["summary"]["resolved"]
+    else:
+        payload["error"] = (result.stdout or "swe-rebench-v2 eval produced no report").strip()[-2000:]
+
+    outcome = "resolved" if payload.get("resolved") else payload["status"]
+    emit_progress(
+        f"[{instance_id}] SWE-rebench-V2 evaluation: {outcome}",
+        component="swerebench-eval",
+    )
+    return payload
+
+
 def maybe_run_swerebench_evaluation(
     *,
     instance_id: str,
@@ -332,6 +512,44 @@ def maybe_run_swerebench_evaluation(
             "reason": "agent patch is empty",
             "patch_path": patch_capture.get("patch_path"),
         }
+
+    # Route SWE-rebench-V2 instances to the official evaluator (scripts/eval.py),
+    # which natively supports the V2 schema and all V2 log parsers. The SWE-bench
+    # harness path below cannot evaluate V2 (it assumes the V1 install_config and
+    # is missing most V2 parsers). Selection is automatic by dataset name, or
+    # forced via swerebench_evaluator / SOMA_SWEREBENCH_EVALUATOR = "v2" | "harness".
+    evaluator_value = _resolve_option(runtime_options, "swerebench_evaluator", "SOMA_SWEREBENCH_EVALUATOR")
+    evaluator = str(evaluator_value).strip().lower() if isinstance(evaluator_value, str) else ""
+    is_v2_dataset = "swe-rebench-v2" in str(benchmark_name).strip().lower()
+    if evaluator == "v2" or (evaluator != "harness" and is_v2_dataset):
+        v2_root_value = _resolve_option(runtime_options, "swerebench_v2_root", "SOMA_SWEREBENCH_V2_ROOT")
+        if not (isinstance(v2_root_value, str) and v2_root_value.strip()):
+            return {
+                "status": "unavailable",
+                "evaluator": "swe-rebench-v2",
+                "dataset_name": benchmark_name,
+                "split": split,
+                "reason": "SWE-rebench-V2 evaluator selected but swerebench_v2_root / SOMA_SWEREBENCH_V2_ROOT is not set",
+            }
+        v2_root = Path(v2_root_value).expanduser().resolve()
+        if not v2_root.is_dir():
+            return {
+                "status": "unavailable",
+                "evaluator": "swe-rebench-v2",
+                "dataset_name": benchmark_name,
+                "split": split,
+                "reason": f"configured swerebench_v2_root does not exist: {v2_root}",
+            }
+        return run_swerebench_v2_evaluation(
+            instance_id=instance_id,
+            benchmark_name=benchmark_name,
+            split=split,
+            model_name=model_name,
+            patch_capture=patch_capture,
+            output_dir=output_dir,
+            v2_root=v2_root,
+            runtime_options=runtime_options,
+        )
 
     harness_root_value = _resolve_option(runtime_options, "swerebench_harness_root", "SOMA_SWEREBENCH_HARNESS_ROOT")
     harness_root = None

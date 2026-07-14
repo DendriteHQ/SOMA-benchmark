@@ -969,13 +969,19 @@ def _write_copilot_trajectory(
 def _count_trajectory_steps(trajectory_path: Path) -> int | None:
     """Count agent steps from a copilot trajectory JSONL file.
 
-    Uses the last assistant.turn_end event's turnId (0-indexed) + 1.
-    Falls back to counting assistant.turn_start events if no turn_end is found.
+    Each agent runs its own 0-indexed ``turnId`` sequence: the main agent's
+    turns carry no ``agentId``, while every sub-agent spawned via the ``task``
+    tool emits its own turns tagged with the spawning tool call's ``agentId``.
+    A single global "last turnId" therefore misses all sub-agent steps, so we
+    group turns by ``agentId`` and sum ``max(turnId) + 1`` across every agent.
+
+    Falls back to counting assistant.turn_start events if no turn carries a
+    usable ``turnId``.
     """
     try:
         if not trajectory_path.is_file():
             return None
-        last_turn_end: dict | None = None
+        max_turn_id: dict[object, int] = {}
         turn_start_count = 0
         with trajectory_path.open(encoding="utf-8") as fh:
             for raw_line in fh:
@@ -989,15 +995,22 @@ def _count_trajectory_steps(trajectory_path: Path) -> int | None:
                 entry_type = entry.get("type")
                 if entry_type == "assistant.turn_start":
                     turn_start_count += 1
-                elif entry_type == "assistant.turn_end":
-                    last_turn_end = entry
-        if last_turn_end is not None:
-            turn_id_raw = (last_turn_end.get("data") or {}).get("turnId")
-            if turn_id_raw is not None:
+                elif entry_type != "assistant.turn_end":
+                    continue
+                # Both turn_start and turn_end carry the turnId; using either
+                # keeps the count correct even if one side is missing.
+                turn_id_raw = (entry.get("data") or {}).get("turnId")
+                if turn_id_raw is None:
+                    continue
                 try:
-                    return int(turn_id_raw) + 1
+                    turn_id = int(turn_id_raw)
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                agent_id = entry.get("agentId")
+                if agent_id not in max_turn_id or turn_id > max_turn_id[agent_id]:
+                    max_turn_id[agent_id] = turn_id
+        if max_turn_id:
+            return sum(turn_id + 1 for turn_id in max_turn_id.values())
         if turn_start_count > 0:
             return turn_start_count
         return None

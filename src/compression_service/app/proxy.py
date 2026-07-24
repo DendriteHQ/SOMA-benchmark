@@ -15,6 +15,9 @@ from urllib.request import urlopen
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
+from app.contracts import TransformResponseContract, apply_edit_plan
+from app.token_usage import add_usage_totals, empty_usage_totals, normalize_provider_usage
+
 DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 120.0
 DEFAULT_COMPRESSION_TIMEOUT_SECONDS = 30.0
 DEFAULT_COMPRESSION_BASE_URL = "http://compression-service:8000/"
@@ -34,12 +37,7 @@ HOP_BY_HOP_HEADERS = {
 app = FastAPI(title="SOMA Copilot Custom Proxy", version="0.1.0")
 
 _token_lock = asyncio.Lock()
-_token_totals: dict[str, int] = {
-    "input_tokens": 0,
-    "output_tokens": 0,
-    "cache_read_tokens": 0,
-    "cache_creation_tokens": 0,
-}
+_token_totals: dict[str, int] = empty_usage_totals()
 
 TOKEN_USAGE_LOG_MARKER = "[proxy][token-usage] "
 
@@ -83,31 +81,14 @@ def _extract_usage_from_response(response_body: bytes, content_encoding: str = "
 
 
 async def _accumulate_token_usage(usage: dict) -> None:
-    prompt_details = usage.get("prompt_tokens_details")
-    if not isinstance(prompt_details, dict):
-        prompt_details = {}
+    normalized = normalize_provider_usage(usage)
+    await _accumulate_usage_totals(normalized)
 
-    # Anthropic format: input_tokens = non-cached only, cache_read_input_tokens = cached
-    # OpenAI/Qwen format: prompt_tokens = total (includes cached), cached_tokens = subset
-    # Normalize to Anthropic semantics so total = input + cached + output (no double-count)
-    if "input_tokens" in usage:
-        raw_input = usage["input_tokens"]
-        cache_read = usage.get("cache_read_input_tokens", 0)
-        cache_write = usage.get("cache_creation_input_tokens", 0)
-    else:
-        raw_prompt = usage.get("prompt_tokens") or 0
-        cache_read = prompt_details.get("cached_tokens") or 0
-        cache_write = prompt_details.get("cache_write_tokens") or 0
-        raw_input = raw_prompt - cache_read  # non-cached portion only
 
+async def _accumulate_usage_totals(usage: dict[str, int]) -> None:
     async with _token_lock:
-        _token_totals["input_tokens"] += max(raw_input, 0)
-        _token_totals["output_tokens"] += (
-            usage.get("output_tokens") or usage.get("completion_tokens") or 0
-        )
-        _token_totals["cache_read_tokens"] += cache_read
-        _token_totals["cache_creation_tokens"] += cache_write
-        snapshot = dict(_token_totals)
+        snapshot = add_usage_totals(_token_totals, usage)
+        _token_totals.update(snapshot)
     print(f"{TOKEN_USAGE_LOG_MARKER}{json.dumps(snapshot)}", flush=True)
 
 
@@ -337,7 +318,7 @@ def _transform_payload_via_compression_service(
     payload: dict[str, Any],
     request_id: str,
     compression_base_url: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, int]]:
     transform_url = _build_upstream_url(base_url=compression_base_url, path="transform", query="")
     request_body = json.dumps(
         {
@@ -357,10 +338,8 @@ def _transform_payload_via_compression_service(
     with urlopen(compression_request, timeout=_resolve_compression_timeout_seconds()) as response:
         raw = response.read()
     parsed = json.loads(raw)
-    transformed = parsed.get("payload") if isinstance(parsed, dict) else None
-    if not isinstance(transformed, dict):
-        raise RuntimeError("Compression service returned invalid payload shape; expected object payload.")
-    return transformed
+    response_contract = TransformResponseContract.model_validate(parsed)
+    return apply_edit_plan(payload, response_contract), response_contract.compression_usage.model_dump(mode="json")
 
 
 @app.get("/health")
@@ -400,13 +379,14 @@ async def proxy_passthrough(path: str, request: Request) -> Response:
 
         if isinstance(parsed_payload, dict):
             stripped_payload, protected_prompts = _strip_protected_prompts(parsed_payload)
-            transformed_payload = _transform_payload_via_compression_service(
+            transformed_payload, compression_usage = _transform_payload_via_compression_service(
                 path=path,
                 query=request.url.query,
                 payload=stripped_payload,
                 request_id=request_id,
                 compression_base_url=compression_base_url,
             )
+            await _accumulate_usage_totals(compression_usage)
             transformed_payload = _restore_protected_prompts(transformed_payload, protected_prompts)
             forwarded_body = json.dumps(transformed_payload, ensure_ascii=False).encode("utf-8")
 

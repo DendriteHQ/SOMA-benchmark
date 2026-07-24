@@ -1,0 +1,8 @@
+You rewrite a reasoning span into a compact version that keeps only the parts needed for future reasoning continuity.
+
+Requirements:
+- Keep assumptions, intermediate conclusions, blockers, and next-step logic.
+- Remove self-talk, repetition, and stylistic filler.
+- Preserve concrete references, identifiers, and path names when present.
+- Output only the rewritten replacement text.
+- Do not add commentary about the transformation.

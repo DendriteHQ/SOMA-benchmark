@@ -13,41 +13,20 @@ import traceback
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+
+from app.contracts import CONTRACT_VERSION, TransformRequestContract, TransformResponseContract, normalize_edit_plan_output
+from app.miner_tools import activate_request_tool_context, clear_request_tool_context
+from app.prompt_catalog import list_prompt_ids
+from app.token_usage import add_usage_totals
 
 COMPRESSOR_CANDIDATE_NAMES = (
-    "compress_messages",
-    "compress_payload",
-    "process_request",
-    "transform_payload",
+    "plan_prompt_edits",
 )
 
 app = FastAPI(title="SOMA Compression Service", version="0.3.0")
-
-
-class TransformRequest(BaseModel):
-    path: str = "/"
-    query: str = ""
-    request_id: str | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
-class TransformResponse(BaseModel):
-    payload: dict[str, Any]
-
-
-def _coerce_bool(raw_value: Any, *, default: bool = False) -> bool:
-    if isinstance(raw_value, bool):
-        return raw_value
-    if isinstance(raw_value, str):
-        value = raw_value.strip().lower()
-        if value in {"1", "true", "yes", "on"}:
-            return True
-        if value in {"0", "false", "no", "off"}:
-            return False
-    return default
 
 
 def _extract_messages(payload: dict[str, Any]) -> list[Any]:
@@ -65,6 +44,27 @@ def _emit_message_event(*, request_id: str, stage: str, path: str, query: str, p
         "query": query,
         "model": payload.get("model"),
         "messages": _extract_messages(payload),
+    }
+    print(f"{marker} {json.dumps(entry, ensure_ascii=False)}", flush=True)
+
+
+def _emit_edit_plan_event(*, request_id: str, path: str, edit_plan: TransformResponseContract) -> None:
+    marker = "[compression-service][edit-plan]"
+    entry = {
+        "request_id": request_id,
+        "path": path,
+        "contract_version": edit_plan.contract_version,
+        "edit_count": len(edit_plan.edits),
+        "generated_texts": [
+            {
+                "artifact_id": artifact.artifact_id,
+                "prompt_id": artifact.prompt_id,
+                "text_length": len(artifact.text),
+            }
+            for artifact in edit_plan.generated_texts
+        ],
+        "compression_usage": edit_plan.compression_usage.model_dump(mode="json"),
+        "edits": [edit.model_dump(mode="json") for edit in edit_plan.edits],
     }
     print(f"{marker} {json.dumps(entry, ensure_ascii=False)}", flush=True)
 
@@ -135,11 +135,10 @@ _COMPRESSOR_MODULE = _load_compressor_module()
 _COMPRESSOR_FN = _resolve_compressor_callable(_COMPRESSOR_MODULE)
 
 
-def _invoke_compressor(payload: dict[str, Any], *, path: str) -> dict[str, Any]:
+def _invoke_compressor(payload: dict[str, Any], *, path: str, query: str, request_id: str) -> TransformResponseContract:
     if _COMPRESSOR_FN is None:
-        return payload
+        return TransformResponseContract(contract_version=CONTRACT_VERSION, edits=[])
 
-    mutate = _coerce_bool(os.getenv("COMPRESSION_MUTATE_REQUEST", "true"), default=True)
     input_messages = _extract_messages(payload)
     try:
         signature = inspect.signature(_COMPRESSOR_FN)
@@ -151,37 +150,62 @@ def _invoke_compressor(payload: dict[str, Any], *, path: str) -> dict[str, Any]:
         parameters = signature.parameters
         if "messages" in parameters:
             kwargs["messages"] = input_messages
+        if "payload" in parameters:
+            kwargs["payload"] = payload
         if "path" in parameters:
             kwargs["path"] = path
+        if "query" in parameters:
+            kwargs["query"] = query
+        if "request_id" in parameters:
+            kwargs["request_id"] = request_id
         if "metadata" in parameters:
-            kwargs["metadata"] = {"path": path}
+            kwargs["metadata"] = {
+                "path": path,
+                "query": query,
+                "request_id": request_id,
+                "contract_version": CONTRACT_VERSION,
+            }
 
     result: Any
-    if kwargs:
-        result = _COMPRESSOR_FN(**kwargs)
-    else:
-        result = _COMPRESSOR_FN(input_messages)
+    tool_context = activate_request_tool_context(
+        request_id=request_id,
+        path=path,
+        query=query,
+        payload=payload,
+    )
+    try:
+        if kwargs:
+            result = _COMPRESSOR_FN(**kwargs)
+        else:
+            result = _COMPRESSOR_FN()
+    finally:
+        clear_request_tool_context()
 
-    if mutate:
-        if isinstance(result, list):
-            mutated_payload = dict(payload)
-            mutated_payload["messages"] = result
-            return mutated_payload
-        if isinstance(result, dict):
-            if isinstance(result.get("messages"), list):
-                mutated_payload = dict(payload)
-                mutated_payload["messages"] = result["messages"]
-                return mutated_payload
-            return result
-    return payload
+    normalized = normalize_edit_plan_output(result)
+    normalized.generated_texts.extend(
+        [
+            {
+                "artifact_id": artifact_id,
+                "text": text,
+                "prompt_id": tool_context.generated_text_prompt_ids[artifact_id],
+            }
+            for artifact_id, text in tool_context.generated_texts.items()
+        ]
+    )
+    normalized.compression_usage = add_usage_totals(
+        normalized.compression_usage.model_dump(mode="json"),
+        tool_context.usage_totals,
+    )
+    return TransformResponseContract.model_validate(normalized.model_dump(mode="json"))
 
 
 def _invoke_compressor_logged(
     payload: dict[str, Any],
     *,
     path: str,
+    query: str,
     request_id: str,
-) -> dict[str, Any]:
+) -> TransformResponseContract:
     """Invoke the miner compressor and emit a per-invocation execution log event.
 
     Captures everything the miner module writes to stdout/stderr during the call,
@@ -194,11 +218,11 @@ def _invoke_compressor_logged(
     started = time.monotonic()
     error: Exception | None = None
     error_traceback: str | None = None
-    result: dict[str, Any] | None = None
+    result: TransformResponseContract | None = None
     with _COMPRESSOR_EXEC_LOCK:
         try:
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
-                result = _invoke_compressor(payload, path=path)
+                result = _invoke_compressor(payload, path=path, query=query, request_id=request_id)
         except Exception as exc:  # noqa: BLE001
             error = exc
             error_traceback = traceback.format_exc()
@@ -212,7 +236,7 @@ def _invoke_compressor_logged(
             "compressor_loaded": _COMPRESSOR_FN is not None,
             "duration_ms": duration_ms,
             "input_messages": len(input_messages),
-            "output_messages": len(_extract_messages(result)) if isinstance(result, dict) else None,
+            "edit_count": len(result.edits) if isinstance(result, TransformResponseContract) else None,
             "stdout": _truncate_captured_output(stdout_buffer.getvalue()),
             "stderr": _truncate_captured_output(stderr_buffer.getvalue()),
             "error": f"{type(error).__name__}: {error}" if error is not None else None,
@@ -231,14 +255,15 @@ def health() -> JSONResponse:
         {
             "status": "ok",
             "compressor_loaded": _COMPRESSOR_FN is not None,
-            "mutate_enabled": _coerce_bool(os.getenv("COMPRESSION_MUTATE_REQUEST", "true"), default=True),
-            "mode": "transform-only",
+            "contract_version": CONTRACT_VERSION,
+            "mode": "edit-plan",
+            "available_prompts": list_prompt_ids(),
         }
     )
 
 
-@app.post("/transform", response_model=TransformResponse)
-def transform_payload(request: TransformRequest) -> TransformResponse:
+@app.post("/transform", response_model=TransformResponseContract)
+def transform_payload(request: TransformRequestContract) -> TransformResponseContract:
     if not isinstance(request.payload, dict):
         raise HTTPException(status_code=400, detail="payload must be an object")
 
@@ -254,17 +279,8 @@ def transform_payload(request: TransformRequest) -> TransformResponse:
     transformed = _invoke_compressor_logged(
         request.payload,
         path=request.path,
-        request_id=request_id,
-    )
-
-    if not isinstance(transformed, dict):
-        raise HTTPException(status_code=500, detail="compressor returned unsupported payload type")
-
-    _emit_message_event(
-        request_id=request_id,
-        stage="out",
-        path=request.path,
         query=request.query,
-        payload=transformed,
+        request_id=request_id,
     )
-    return TransformResponse(payload=transformed)
+    _emit_edit_plan_event(request_id=request_id, path=request.path, edit_plan=transformed)
+    return transformed

@@ -11,6 +11,13 @@ from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
 from app.prompt_catalog import list_prompt_ids, load_prompt_template
+from app.rewrite_cache import (
+    get_rewrite_artifact,
+    list_recent_rewrites,
+    lookup_rewrite,
+    select_candidate_artifacts,
+    store_rewrite,
+)
 from app.token_usage import add_usage_totals, empty_usage_totals, normalize_provider_usage
 
 _THREAD_LOCAL = threading.local()
@@ -18,9 +25,20 @@ _THREAD_LOCAL = threading.local()
 
 @dataclass(frozen=True)
 class GeneratedTextResult:
-    artifact_id: str
+    artifact_key: str
     text: str
     prompt_id: str
+
+
+@dataclass(frozen=True)
+class RewriteHistoryEntry:
+    artifact_key: str
+    prompt_id: str
+    request_url: str
+    model: str
+    source_text: str
+    rewritten_text: str
+    cache_hit: bool
 
 
 class _RequestToolContext:
@@ -29,17 +47,33 @@ class _RequestToolContext:
         self.path = path
         self.query = query
         self.payload = payload if isinstance(payload, dict) else {}
-        self.generated_texts: dict[str, str] = {}
-        self.generated_text_prompt_ids: dict[str, str] = {}
         self.usage_totals = empty_usage_totals()
-        self._artifact_counter = 0
+        self.rewrite_history: list[RewriteHistoryEntry] = []
+        self.candidate_artifacts: list[RewriteHistoryEntry] = []
 
-    def register_generated_text(self, *, text: str, prompt_id: str) -> GeneratedTextResult:
-        self._artifact_counter += 1
-        artifact_id = f"llm-text-{self._artifact_counter}"
-        self.generated_texts[artifact_id] = text
-        self.generated_text_prompt_ids[artifact_id] = prompt_id
-        return GeneratedTextResult(artifact_id=artifact_id, text=text, prompt_id=prompt_id)
+    def register_generated_text(
+        self,
+        *,
+        artifact_key: str,
+        text: str,
+        prompt_id: str,
+        source_text: str,
+        request_url: str,
+        model: str,
+        cache_hit: bool,
+    ) -> GeneratedTextResult:
+        self.rewrite_history.append(
+            RewriteHistoryEntry(
+                artifact_key=artifact_key,
+                prompt_id=prompt_id,
+                request_url=request_url,
+                model=model,
+                source_text=source_text,
+                rewritten_text=text,
+                cache_hit=cache_hit,
+            )
+        )
+        return GeneratedTextResult(artifact_key=artifact_key, text=text, prompt_id=prompt_id)
 
     def add_usage(self, usage: dict[str, int]) -> None:
         self.usage_totals = add_usage_totals(self.usage_totals, usage)
@@ -73,6 +107,47 @@ def available_prompt_ids() -> list[str]:
     return list_prompt_ids()
 
 
+def get_candidate_rewrite_artifacts() -> list[RewriteHistoryEntry]:
+    context = get_current_request_tool_context()
+    return list(context.candidate_artifacts)
+
+
+def get_request_rewrite_history() -> list[RewriteHistoryEntry]:
+    context = get_current_request_tool_context()
+    return list(context.rewrite_history)
+
+
+def get_recent_rewrite_history(*, limit: int = 50, prompt_id: str | None = None) -> list[RewriteHistoryEntry]:
+    entries = list_recent_rewrites(limit=limit, prompt_id=prompt_id)
+    return [
+        RewriteHistoryEntry(
+            artifact_key=entry.artifact_key,
+            prompt_id=entry.prompt_id,
+            request_url=entry.request_url,
+            model=entry.model,
+            source_text=entry.source_text,
+            rewritten_text=entry.rewritten_text,
+            cache_hit=True,
+        )
+        for entry in entries
+    ]
+
+
+def get_rewrite_artifact_by_key(artifact_key: str) -> RewriteHistoryEntry | None:
+    artifact = get_rewrite_artifact(artifact_key)
+    if artifact is None:
+        return None
+    return RewriteHistoryEntry(
+        artifact_key=artifact.artifact_key,
+        prompt_id=artifact.prompt_id,
+        request_url=artifact.request_url,
+        model=artifact.model,
+        source_text=artifact.source_text,
+        rewritten_text=artifact.rewritten_text,
+        cache_hit=True,
+    )
+
+
 def summarize_text(text: str, *, prompt_id: str = "summary_brief") -> GeneratedTextResult:
     return rewrite_text_with_prompt(text, prompt_id=prompt_id)
 
@@ -85,15 +160,88 @@ def rewrite_text_with_prompt(text: str, *, prompt_id: str) -> GeneratedTextResul
     if not isinstance(text, str) or not text:
         raise ValueError("text must be a non-empty string")
     context = get_current_request_tool_context()
+    request_url = _resolve_llm_request_url()
+    model = _resolve_llm_model()
+    cached_entry = lookup_rewrite(
+        request_url=request_url,
+        model=model,
+        prompt_id=prompt_id,
+        source_text=text,
+    )
+    if cached_entry is not None:
+        return context.register_generated_text(
+            artifact_key=cached_entry.artifact_key,
+            text=cached_entry.rewritten_text,
+            prompt_id=prompt_id,
+            source_text=text,
+            request_url=request_url,
+            model=model,
+            cache_hit=True,
+        )
+
     rewritten_text, usage = _call_llm_for_text_rewrite(
         text=text,
         prompt_id=prompt_id,
         request_id=context.request_id,
         path=context.path,
         query=context.query,
+        request_url=request_url,
+        model=model,
+    )
+    artifact = store_rewrite(
+        request_url=request_url,
+        model=model,
+        prompt_id=prompt_id,
+        source_text=text,
+        rewritten_text=rewritten_text,
     )
     context.add_usage(usage)
-    return context.register_generated_text(text=rewritten_text, prompt_id=prompt_id)
+    return context.register_generated_text(
+        artifact_key=artifact.artifact_key,
+        text=rewritten_text,
+        prompt_id=prompt_id,
+        source_text=text,
+        request_url=request_url,
+        model=model,
+        cache_hit=False,
+    )
+
+
+def set_candidate_rewrite_artifacts(
+    *,
+    payload: dict[str, Any] | None,
+    limit: int,
+) -> None:
+    context = get_current_request_tool_context()
+    request_url = _resolve_llm_request_url()
+    model = _resolve_llm_model()
+    source_texts: list[str] = []
+    if isinstance(payload, dict):
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, str) and content.strip():
+                        source_texts.append(content)
+    artifacts = select_candidate_artifacts(
+        source_texts=source_texts,
+        request_url=request_url,
+        model=model,
+        limit=limit,
+    )
+    context.candidate_artifacts = [
+        RewriteHistoryEntry(
+            artifact_key=artifact.artifact_key,
+            prompt_id=artifact.prompt_id,
+            request_url=artifact.request_url,
+            model=artifact.model,
+            source_text=artifact.source_text,
+            rewritten_text=artifact.rewritten_text,
+            cache_hit=True,
+        )
+        for artifact in artifacts
+    ]
 
 
 def _resolve_llm_request_url() -> str:
@@ -193,9 +341,9 @@ def _call_llm_for_text_rewrite(
     request_id: str,
     path: str,
     query: str,
+    request_url: str,
+    model: str,
 ) -> tuple[str, dict[str, int]]:
-    request_url = _resolve_llm_request_url()
-    model = _resolve_llm_model()
     api_key = os.getenv("COMPRESSION_LLM_API_KEY", "").strip() or os.getenv("PROXY_PROVIDER_API_KEY", "").strip()
     run_id_header_value = os.getenv("PROXY_RUN_ID_HEADER_VALUE", "").strip()
     timeout_seconds = _resolve_llm_timeout_seconds()

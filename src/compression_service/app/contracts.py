@@ -5,6 +5,8 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 CONTRACT_VERSION = "soma.cot.edit-plan.v1"
+EDIT_STRING_TARGET_FIELDS = ("content", "reasoning", "reasoning_details")
+EditTargetField = Literal["content", "reasoning", "reasoning_details"]
 
 APPEND_LITERAL_TEMPLATES: dict[str, str] = {
     "compressed_text_starts_here": "Compressed text starts here",
@@ -36,6 +38,7 @@ class _ContractModel(BaseModel):
 class RemoveSpanEdit(_ContractModel):
     op: Literal["remove_span"]
     message_index: int = Field(ge=0)
+    target: EditTargetField = "content"
     start: int = Field(ge=0)
     end: int = Field(ge=0)
 
@@ -51,23 +54,31 @@ class RemoveMessageEdit(_ContractModel):
     message_index: int = Field(ge=0)
 
 
-class ReplaceSpanWithGeneratedTextEdit(_ContractModel):
-    op: Literal["replace_span_with_generated_text"]
+class RemoveMessagePartEdit(_ContractModel):
+    op: Literal["remove_message_part"]
     message_index: int = Field(ge=0)
+    target: EditTargetField
+
+
+class ReplaceSpanWithArtifactEdit(_ContractModel):
+    op: Literal["replace_span_with_artifact"]
+    message_index: int = Field(ge=0)
+    target: EditTargetField = "content"
     start: int = Field(ge=0)
     end: int = Field(ge=0)
-    artifact_id: str = Field(min_length=1)
+    artifact_key: str = Field(min_length=1)
 
     @model_validator(mode="after")
-    def _validate_span(self) -> "ReplaceSpanWithGeneratedTextEdit":
+    def _validate_span(self) -> "ReplaceSpanWithArtifactEdit":
         if self.end <= self.start:
-            raise ValueError("replace_span_with_generated_text requires end > start")
+            raise ValueError("replace_span_with_artifact requires end > start")
         return self
 
 
 class ReplaceSpanWithLiteralEdit(_ContractModel):
     op: Literal["replace_span_with_literal"]
     message_index: int = Field(ge=0)
+    target: EditTargetField = "content"
     start: int = Field(ge=0)
     end: int = Field(ge=0)
     literal_id: Literal[
@@ -111,6 +122,7 @@ class ReplaceSpanWithLiteralEdit(_ContractModel):
 class WrapSpanEdit(_ContractModel):
     op: Literal["wrap_span"]
     message_index: int = Field(ge=0)
+    target: EditTargetField = "content"
     start: int = Field(ge=0)
     end: int = Field(ge=0)
     template: Literal["cmp", "omitted", "deleted", "block"]
@@ -130,6 +142,7 @@ class WrapSpanEdit(_ContractModel):
 class ReplaceWithBlockRefEdit(_ContractModel):
     op: Literal["replace_with_block_ref"]
     message_index: int = Field(ge=0)
+    target: EditTargetField = "content"
     start: int = Field(ge=0)
     end: int = Field(ge=0)
     block_id: int = Field(ge=1)
@@ -144,6 +157,24 @@ class ReplaceWithBlockRefEdit(_ContractModel):
 class AppendLiteralEdit(_ContractModel):
     op: Literal["append_literal"]
     message_index: int = Field(ge=0)
+    target: EditTargetField = "content"
+    literal_id: Literal[
+        "compressed_text_starts_here",
+        "compressed_text_ends_here",
+        "cmp_open",
+        "cmp_close",
+        "omitted_open",
+        "omitted_close",
+        "deleted_open",
+        "deleted_close",
+    ]
+
+
+class InsertLiteralEdit(_ContractModel):
+    op: Literal["insert_literal"]
+    message_index: int = Field(ge=0)
+    target: EditTargetField = "content"
+    position: int = Field(ge=0)
     literal_id: Literal[
         "compressed_text_starts_here",
         "compressed_text_ends_here",
@@ -159,17 +190,20 @@ class AppendLiteralEdit(_ContractModel):
 class AppendLoopGuardEdit(_ContractModel):
     op: Literal["append_loop_guard"]
     message_index: int = Field(ge=0)
+    target: EditTargetField = "content"
     reason: Literal["repeated_assistant_response", "repeated_tool_call_signature"]
 
 
 PromptEdit = Annotated[
     RemoveMessageEdit
+    | RemoveMessagePartEdit
     | RemoveSpanEdit
-    | ReplaceSpanWithGeneratedTextEdit
+    | ReplaceSpanWithArtifactEdit
     | ReplaceSpanWithLiteralEdit
     | WrapSpanEdit
     | ReplaceWithBlockRefEdit
     | AppendLiteralEdit
+    | InsertLiteralEdit
     | AppendLoopGuardEdit,
     Field(discriminator="op"),
 ]
@@ -180,10 +214,14 @@ class EditPlan(_ContractModel):
     edits: list[PromptEdit] = Field(default_factory=list)
 
 
-class GeneratedTextArtifact(_ContractModel):
-    artifact_id: str = Field(min_length=1)
+class RewriteArtifactContract(_ContractModel):
+    artifact_key: str = Field(min_length=1)
+    source_text: str
     text: str
     prompt_id: str = Field(min_length=1)
+    request_url: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    cache_hit: bool = False
 
 
 class CompressionUsage(_ContractModel):
@@ -203,7 +241,7 @@ class TransformRequestContract(_ContractModel):
 class TransformResponseContract(_ContractModel):
     contract_version: Literal[CONTRACT_VERSION] = CONTRACT_VERSION
     edits: list[PromptEdit] = Field(default_factory=list)
-    generated_texts: list[GeneratedTextArtifact] = Field(default_factory=list)
+    artifacts: list[RewriteArtifactContract] = Field(default_factory=list)
     compression_usage: CompressionUsage = Field(default_factory=CompressionUsage)
 
 
@@ -266,16 +304,21 @@ def _append_text(existing: str, suffix: str) -> str:
     return f"{existing}{suffix}"
 
 
-def _ensure_message_text(messages: list[Any], message_index: int) -> tuple[dict[str, Any], str]:
+def _ensure_message_text(
+    messages: list[Any],
+    message_index: int,
+    *,
+    target: EditTargetField,
+) -> tuple[dict[str, Any], str]:
     if message_index >= len(messages):
         raise ValueError(f"message_index {message_index} is out of range for payload with {len(messages)} messages")
     message = messages[message_index]
     if not isinstance(message, dict):
         raise ValueError(f"message at index {message_index} is not an object")
-    content = message.get("content")
-    if not isinstance(content, str):
-        raise ValueError(f"message at index {message_index} has non-string content and cannot be edited")
-    return dict(message), content
+    value = message.get(target)
+    if not isinstance(value, str):
+        raise ValueError(f"message at index {message_index} has non-string {target!r} and cannot be edited")
+    return dict(message), value
 
 
 def _validate_block_references(edits: list[PromptEdit]) -> None:
@@ -304,40 +347,82 @@ def _validate_removed_message_indices(messages: list[Any], edits: list[PromptEdi
     return removed_indices
 
 
+def _validate_removed_message_part_targets(messages: list[Any], edits: list[PromptEdit]) -> dict[int, set[EditTargetField]]:
+    removed_targets_by_message: dict[int, set[EditTargetField]] = {}
+    message_count = len(messages)
+    for edit in edits:
+        if not isinstance(edit, RemoveMessagePartEdit):
+            continue
+        if edit.message_index >= message_count:
+            raise ValueError(
+                f"remove_message_part has message_index {edit.message_index} out of range for payload with {message_count} messages"
+            )
+        message = messages[edit.message_index]
+        if not isinstance(message, dict):
+            raise ValueError(f"message at index {edit.message_index} is not an object")
+        if edit.target not in message:
+            raise ValueError(
+                f"remove_message_part target {edit.target!r} is missing on message_index {edit.message_index}"
+            )
+        removed_targets_by_message.setdefault(edit.message_index, set()).add(edit.target)
+    return removed_targets_by_message
+
+
 def _artifact_map(response: TransformResponseContract) -> dict[str, str]:
     artifacts: dict[str, str] = {}
-    for artifact in response.generated_texts:
-        if artifact.artifact_id in artifacts:
-            raise ValueError(f"duplicate generated text artifact_id {artifact.artifact_id!r}")
-        artifacts[artifact.artifact_id] = artifact.text
+    for artifact in response.artifacts:
+        if artifact.artifact_key in artifacts:
+            raise ValueError(f"duplicate artifact_key {artifact.artifact_key!r}")
+        artifacts[artifact.artifact_key] = artifact.text
     return artifacts
 
 
-def _validate_generated_text_references(edits: list[PromptEdit], artifacts: dict[str, str]) -> None:
+def _validate_artifact_references(edits: list[PromptEdit], artifacts: dict[str, str]) -> None:
     for edit in edits:
-        if isinstance(edit, ReplaceSpanWithGeneratedTextEdit) and edit.artifact_id not in artifacts:
-            raise ValueError(f"replace_span_with_generated_text references unknown artifact_id {edit.artifact_id!r}")
+        if isinstance(edit, ReplaceSpanWithArtifactEdit) and edit.artifact_key not in artifacts:
+            raise ValueError(f"replace_span_with_artifact references unknown artifact_key {edit.artifact_key!r}")
 
 
-def _sorted_span_edits(edits: list[PromptEdit], *, message_length: int, message_index: int) -> list[PromptEdit]:
-    span_edits = [
+def _sorted_positioned_edits(
+    edits: list[PromptEdit],
+    *,
+    message_length: int,
+    message_index: int,
+    target: EditTargetField,
+) -> list[PromptEdit]:
+    positioned_edits = [
         edit
         for edit in edits
         if isinstance(
             edit,
             (
                 RemoveSpanEdit,
-                ReplaceSpanWithGeneratedTextEdit,
+                ReplaceSpanWithArtifactEdit,
                 ReplaceSpanWithLiteralEdit,
                 WrapSpanEdit,
                 ReplaceWithBlockRefEdit,
+                InsertLiteralEdit,
             ),
         )
         and edit.message_index == message_index
+        and edit.target == target
     ]
-    span_edits.sort(key=lambda item: (item.start, item.end))
+    positioned_edits.sort(
+        key=lambda item: (
+            item.position if isinstance(item, InsertLiteralEdit) else item.start,
+            item.position if isinstance(item, InsertLiteralEdit) else item.end,
+        )
+    )
     previous_end = -1
-    for edit in span_edits:
+    for edit in positioned_edits:
+        if isinstance(edit, InsertLiteralEdit):
+            if edit.position > message_length:
+                raise ValueError(
+                    f"insert_literal has position={edit.position} beyond message length {message_length} for message_index {message_index}"
+                )
+            if edit.position < previous_end:
+                raise ValueError(f"insert_literal cannot be placed inside another edited span for message_index {message_index}")
+            continue
         if edit.end > message_length:
             raise ValueError(
                 f"{edit.op} has end={edit.end} beyond message length {message_length} for message_index {message_index}"
@@ -345,7 +430,7 @@ def _sorted_span_edits(edits: list[PromptEdit], *, message_length: int, message_
         if edit.start < previous_end:
             raise ValueError(f"overlapping span edits are not allowed for message_index {message_index}")
         previous_end = edit.end
-    return span_edits
+    return positioned_edits
 
 
 def apply_edit_plan(payload: dict[str, Any], plan: TransformResponseContract | dict[str, Any]) -> dict[str, Any]:
@@ -359,14 +444,15 @@ def apply_edit_plan(payload: dict[str, Any], plan: TransformResponseContract | d
 
     _validate_block_references(response.edits)
     artifacts = _artifact_map(response)
-    _validate_generated_text_references(response.edits, artifacts)
+    _validate_artifact_references(response.edits, artifacts)
 
     mutated_payload = dict(payload)
     mutated_messages: list[Any] = list(messages)
     removed_message_indices = _validate_removed_message_indices(mutated_messages, response.edits)
+    removed_message_part_targets = _validate_removed_message_part_targets(mutated_messages, response.edits)
     grouped_edits: dict[int, list[PromptEdit]] = {}
     for edit in response.edits:
-        if isinstance(edit, RemoveMessageEdit):
+        if isinstance(edit, (RemoveMessageEdit, RemoveMessagePartEdit)):
             continue
         grouped_edits.setdefault(edit.message_index, []).append(edit)
 
@@ -375,42 +461,63 @@ def apply_edit_plan(payload: dict[str, Any], plan: TransformResponseContract | d
             raise ValueError(
                 f"message_index {message_index} cannot have both remove_message and other edits in the same plan"
             )
-        message_copy, content = _ensure_message_text(mutated_messages, message_index)
-        span_edits = _sorted_span_edits(message_edits, message_length=len(content), message_index=message_index)
-
-        updated_content = content
-        for edit in reversed(span_edits):
-            if isinstance(edit, RemoveSpanEdit):
-                replacement = ""
-            elif isinstance(edit, ReplaceSpanWithGeneratedTextEdit):
-                replacement = artifacts[edit.artifact_id]
-            elif isinstance(edit, ReplaceSpanWithLiteralEdit):
-                replacement = render_literal_replacement(
-                    edit.literal_id,
-                    line_start=edit.line_start,
-                    line_end=edit.line_end,
-                )
-            elif isinstance(edit, WrapSpanEdit):
-                opening, closing = render_span_wrapper(edit.template, block_id=edit.block_id)
-                replacement = f"{opening}{updated_content[edit.start:edit.end]}{closing}"
-            elif isinstance(edit, ReplaceWithBlockRefEdit):
-                replacement = render_block_reference(edit.block_id)
-            else:
+        message_copy = dict(mutated_messages[message_index]) if isinstance(mutated_messages[message_index], dict) else {}
+        removed_targets = removed_message_part_targets.get(message_index, set())
+        for target in removed_targets:
+            message_copy.pop(target, None)
+        for target in EDIT_STRING_TARGET_FIELDS:
+            target_edits = [edit for edit in message_edits if getattr(edit, "target", "content") == target]
+            if not target_edits:
                 continue
-            updated_content = f"{updated_content[:edit.start]}{replacement}{updated_content[edit.end:]}"
+            if target in removed_targets:
+                raise ValueError(
+                    f"message_index {message_index} target {target!r} cannot have both remove_message_part and other edits"
+                )
+            message_copy, content = _ensure_message_text(mutated_messages, message_index, target=target)
+            positioned_edits = _sorted_positioned_edits(
+                target_edits,
+                message_length=len(content),
+                message_index=message_index,
+                target=target,
+            )
 
-        append_edits = [
-            edit
-            for edit in message_edits
-            if isinstance(edit, (AppendLiteralEdit, AppendLoopGuardEdit))
-        ]
-        for edit in append_edits:
-            if isinstance(edit, AppendLiteralEdit):
-                updated_content = _append_text(updated_content, render_append_literal(edit.literal_id))
-            elif isinstance(edit, AppendLoopGuardEdit):
-                updated_content = _append_text(updated_content, render_loop_guard(edit.reason))
+            updated_content = content
+            for edit in reversed(positioned_edits):
+                if isinstance(edit, InsertLiteralEdit):
+                    replacement = render_append_literal(edit.literal_id)
+                    updated_content = f"{updated_content[:edit.position]}{replacement}{updated_content[edit.position:]}"
+                    continue
+                if isinstance(edit, RemoveSpanEdit):
+                    replacement = ""
+                elif isinstance(edit, ReplaceSpanWithArtifactEdit):
+                    replacement = artifacts[edit.artifact_key]
+                elif isinstance(edit, ReplaceSpanWithLiteralEdit):
+                    replacement = render_literal_replacement(
+                        edit.literal_id,
+                        line_start=edit.line_start,
+                        line_end=edit.line_end,
+                    )
+                elif isinstance(edit, WrapSpanEdit):
+                    opening, closing = render_span_wrapper(edit.template, block_id=edit.block_id)
+                    replacement = f"{opening}{updated_content[edit.start:edit.end]}{closing}"
+                elif isinstance(edit, ReplaceWithBlockRefEdit):
+                    replacement = render_block_reference(edit.block_id)
+                else:
+                    continue
+                updated_content = f"{updated_content[:edit.start]}{replacement}{updated_content[edit.end:]}"
 
-        message_copy["content"] = updated_content
+            append_edits = [
+                edit
+                for edit in target_edits
+                if isinstance(edit, (AppendLiteralEdit, AppendLoopGuardEdit))
+            ]
+            for edit in append_edits:
+                if isinstance(edit, AppendLiteralEdit):
+                    updated_content = _append_text(updated_content, render_append_literal(edit.literal_id))
+                elif isinstance(edit, AppendLoopGuardEdit):
+                    updated_content = _append_text(updated_content, render_loop_guard(edit.reason))
+
+            message_copy[target] = updated_content
         mutated_messages[message_index] = message_copy
 
     mutated_payload["messages"] = [

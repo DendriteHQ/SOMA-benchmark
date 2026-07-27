@@ -17,9 +17,20 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from app.contracts import CONTRACT_VERSION, TransformRequestContract, TransformResponseContract, normalize_edit_plan_output
-from app.miner_tools import activate_request_tool_context, clear_request_tool_context
+from app.contracts import (
+    CONTRACT_VERSION,
+    ReplaceSpanWithArtifactEdit,
+    TransformRequestContract,
+    TransformResponseContract,
+    normalize_edit_plan_output,
+)
+from app.miner_tools import (
+    activate_request_tool_context,
+    clear_request_tool_context,
+    set_candidate_rewrite_artifacts,
+)
 from app.prompt_catalog import list_prompt_ids
+from app.rewrite_cache import get_rewrite_artifact
 from app.token_usage import add_usage_totals
 
 COMPRESSOR_CANDIDATE_NAMES = (
@@ -55,13 +66,15 @@ def _emit_edit_plan_event(*, request_id: str, path: str, edit_plan: TransformRes
         "path": path,
         "contract_version": edit_plan.contract_version,
         "edit_count": len(edit_plan.edits),
-        "generated_texts": [
+        "artifacts": [
             {
-                "artifact_id": artifact.artifact_id,
+                "artifact_key": artifact.artifact_key,
                 "prompt_id": artifact.prompt_id,
                 "text_length": len(artifact.text),
+                "source_text_length": len(artifact.source_text),
+                "cache_hit": artifact.cache_hit,
             }
-            for artifact in edit_plan.generated_texts
+            for artifact in edit_plan.artifacts
         ],
         "compression_usage": edit_plan.compression_usage.model_dump(mode="json"),
         "edits": [edit.model_dump(mode="json") for edit in edit_plan.edits],
@@ -158,13 +171,9 @@ def _invoke_compressor(payload: dict[str, Any], *, path: str, query: str, reques
             kwargs["query"] = query
         if "request_id" in parameters:
             kwargs["request_id"] = request_id
-        if "metadata" in parameters:
-            kwargs["metadata"] = {
-                "path": path,
-                "query": query,
-                "request_id": request_id,
-                "contract_version": CONTRACT_VERSION,
-            }
+        metadata_enabled = "metadata" in parameters
+    else:
+        metadata_enabled = False
 
     result: Any
     tool_context = activate_request_tool_context(
@@ -174,6 +183,29 @@ def _invoke_compressor(payload: dict[str, Any], *, path: str, query: str, reques
         payload=payload,
     )
     try:
+        set_candidate_rewrite_artifacts(
+            payload=payload,
+            limit=int(os.getenv("COMPRESSION_ARTIFACT_CANDIDATE_LIMIT", "40").strip() or "40"),
+        )
+        if metadata_enabled:
+            kwargs["metadata"] = {
+                "path": path,
+                "query": query,
+                "request_id": request_id,
+                "contract_version": CONTRACT_VERSION,
+                "artifacts": [
+                    {
+                        "artifact_key": artifact.artifact_key,
+                        "prompt_id": artifact.prompt_id,
+                        "request_url": artifact.request_url,
+                        "model": artifact.model,
+                        "source_text": artifact.source_text,
+                        "rewritten_text": artifact.rewritten_text,
+                        "cache_hit": artifact.cache_hit,
+                    }
+                    for artifact in tool_context.candidate_artifacts
+                ],
+            }
         if kwargs:
             result = _COMPRESSOR_FN(**kwargs)
         else:
@@ -182,16 +214,41 @@ def _invoke_compressor(payload: dict[str, Any], *, path: str, query: str, reques
         clear_request_tool_context()
 
     normalized = normalize_edit_plan_output(result)
-    normalized.generated_texts.extend(
+    normalized.artifacts.extend(
         [
             {
-                "artifact_id": artifact_id,
-                "text": text,
-                "prompt_id": tool_context.generated_text_prompt_ids[artifact_id],
+                "artifact_key": entry.artifact_key,
+                "source_text": entry.source_text,
+                "text": entry.rewritten_text,
+                "prompt_id": entry.prompt_id,
+                "request_url": entry.request_url,
+                "model": entry.model,
+                "cache_hit": entry.cache_hit,
             }
-            for artifact_id, text in tool_context.generated_texts.items()
+            for entry in tool_context.rewrite_history
         ]
     )
+    known_keys = {artifact.artifact_key for artifact in normalized.artifacts}
+    for edit in normalized.edits:
+        if not isinstance(edit, ReplaceSpanWithArtifactEdit):
+            continue
+        if edit.artifact_key in known_keys:
+            continue
+        artifact = get_rewrite_artifact(edit.artifact_key)
+        if artifact is None:
+            raise RuntimeError(f"unknown artifact_key referenced by edit plan: {edit.artifact_key}")
+        normalized.artifacts.append(
+            {
+                "artifact_key": artifact.artifact_key,
+                "source_text": artifact.source_text,
+                "text": artifact.rewritten_text,
+                "prompt_id": artifact.prompt_id,
+                "request_url": artifact.request_url,
+                "model": artifact.model,
+                "cache_hit": True,
+            }
+        )
+        known_keys.add(artifact.artifact_key)
     normalized.compression_usage = add_usage_totals(
         normalized.compression_usage.model_dump(mode="json"),
         tool_context.usage_totals,

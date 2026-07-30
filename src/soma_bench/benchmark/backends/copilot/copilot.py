@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -36,6 +38,12 @@ COPILOT_DEFAULT_COMPRESSION_IMAGE = "soma-copilot-compression-service:latest"
 COPILOT_DEFAULT_COMPRESSION_SCRIPT_CONTAINER_PATH = "/app/miner/base_miner.py"
 COPILOT_DEFAULT_SWE_SANDBOX_SERVICE = "swe-sandbox"
 COPILOT_DEFAULT_SWE_SANDBOX_REPO_PATH = "/testbed"
+COPILOT_DEFAULT_DIND_SERVICE = "dind"
+COPILOT_DEFAULT_DIND_IMAGE = "docker:dind"
+COPILOT_DIND_PORT = 2375
+COPILOT_DIND_WORKSPACE_MOUNT = "/workspace"
+COPILOT_DIND_START_RETRIES = 60
+COPILOT_DIND_START_SLEEP_SECONDS = 0.5
 COPILOT_WORKSPACE_VOLUME_BASENAME = "copilot-workspace"
 COPILOT_DEFAULT_IMAGE = "local/copilot-cli:latest"
 COPILOT_DEFAULT_NETWORK_ISOLATION = True
@@ -51,9 +59,19 @@ COPILOT_DEFAULT_SHARED_PROXY_TEARDOWN = True
 COPILOT_DEFAULT_RUN_RETENTION_SECONDS = 24 * 60 * 60
 COPILOT_DEFAULT_RUN_CLEANUP_INTERVAL_SECONDS = 5 * 60
 COPILOT_DEFAULT_PRESERVE_RUN_DIRS = False
+COPILOT_PROJECT_NAME_PREFIX = "soma-copilot-"
+COPILOT_STALE_SIDECAR_MAX_AGE_ENV = "SOMA_COPILOT_STALE_SIDECAR_MAX_AGE_SECONDS"
+COPILOT_STALE_CLEANUP_INTERVAL_ENV = "SOMA_COPILOT_STALE_CLEANUP_INTERVAL_SECONDS"
+COPILOT_DEFAULT_STALE_SIDECAR_MAX_AGE_SECONDS = 30 * 60
+COPILOT_DEFAULT_STALE_CLEANUP_INTERVAL_SECONDS = 5 * 60
 
 _run_root_cleanup_lock = threading.Lock()
 _last_run_root_cleanup_monotonic = 0.0
+_stale_docker_resource_cleanup_lock = threading.Lock()
+_last_stale_docker_resource_cleanup_monotonic = 0.0
+_COMPOSE_PROJECT_CONTAINER_RE = re.compile(
+    r"^(" + re.escape(COPILOT_PROJECT_NAME_PREFIX) + r"[0-9a-f]+)-(dind|proxy|compression-service)-\S+$"
+)
 
 
 def _resolve_runtime_options(context: RuntimeExecutionContext) -> dict[str, Any]:
@@ -263,6 +281,134 @@ def _maybe_cleanup_stale_run_dirs(context: RuntimeExecutionContext, *, base_root
         )
 
 
+def _resolve_stale_sidecar_max_age_seconds(context: RuntimeExecutionContext) -> int:
+    return _coerce_positive_int_option(
+        _resolve_runtime_option(context, "copilot_stale_sidecar_max_age_seconds")
+        or os.getenv(COPILOT_STALE_SIDECAR_MAX_AGE_ENV),
+        COPILOT_DEFAULT_STALE_SIDECAR_MAX_AGE_SECONDS,
+    )
+
+
+def _resolve_stale_docker_cleanup_interval_seconds(context: RuntimeExecutionContext) -> int:
+    return _coerce_positive_int_option(
+        _resolve_runtime_option(context, "copilot_stale_cleanup_interval_seconds")
+        or os.getenv(COPILOT_STALE_CLEANUP_INTERVAL_ENV),
+        COPILOT_DEFAULT_STALE_CLEANUP_INTERVAL_SECONDS,
+    )
+
+
+def _docker_container_created_epoch(name: str) -> float | None:
+    result = _run_command(["docker", "inspect", "-f", "{{.Created}}", name])
+    if result.returncode != 0:
+        return None
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return None
+    normalized = raw
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    normalized = re.sub(r"\.(\d{6})\d+(?=[+-]\d{2}:\d{2}$)", r".\1", normalized)
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _find_stale_copilot_projects(*, keep_project: str, max_age_seconds: int) -> list[str]:
+    listing = _run_command(["docker", "ps", "-a", "--format", "{{.Names}}"])
+    if listing.returncode != 0:
+        return []
+
+    projects: dict[str, list[str]] = {}
+    for name in (listing.stdout or "").splitlines():
+        name = name.strip()
+        match = _COMPOSE_PROJECT_CONTAINER_RE.match(name)
+        if not match:
+            continue
+        project = match.group(1)
+        if project == keep_project:
+            continue
+        projects.setdefault(project, []).append(name)
+
+    now_epoch = time.time()
+    stale: list[str] = []
+    for project, container_names in projects.items():
+        # A project is only stale once every sidecar container belonging to it is old
+        # enough - a freshly started concurrent run must never be torn down mid-flight.
+        ages = [_docker_container_created_epoch(name) for name in container_names]
+        if any(age is None for age in ages):
+            continue
+        if all(now_epoch - age >= max_age_seconds for age in ages):
+            stale.append(project)
+    return stale
+
+
+def _teardown_stale_copilot_project(context: RuntimeExecutionContext, *, project: str) -> bool:
+    compose_file = _resolve_compose_file(context)
+    env = os.environ.copy()
+    env["COMPOSE_PROFILES"] = "copilot-sidecars"
+    workspace_volume = _workspace_volume_name(compose_project=project)
+    env["COPILOT_WORKSPACE_VOLUME_NAME"] = workspace_volume
+
+    down_result = _run_command(
+        [
+            "docker", "compose", "-f", str(compose_file),
+            "--project-name", project,
+            "down", "--remove-orphans", "--volumes",
+        ],
+        env=env,
+    )
+    _remove_workspace_volume(volume_name=workspace_volume)
+    if down_result.returncode != 0:
+        emit_progress(
+            f"[copilot] failed to tear down stale stack {project!r}: "
+            f"{(down_result.stderr or down_result.stdout or '').strip()}",
+            component="copilot",
+        )
+        return False
+    return True
+
+
+def _maybe_cleanup_stale_copilot_docker_resources(
+    context: RuntimeExecutionContext,
+    *,
+    keep_project: str,
+) -> None:
+    """Tear down dind/proxy/compression-service stacks orphaned by a crashed or killed run.
+
+    The `finally` block that normally runs `docker compose down --volumes` never fires if the
+    process is SIGKILLed mid-run, leaving the dind sidecar (and its multi-GB nested image
+    storage in an anonymous /var/lib/docker volume) on disk indefinitely. This sweep catches
+    those by age, mirroring the equivalent stale-resource sweep in the openclaw backend.
+    """
+    cleanup_interval_seconds = _resolve_stale_docker_cleanup_interval_seconds(context)
+
+    global _last_stale_docker_resource_cleanup_monotonic
+    now_monotonic = time.monotonic()
+    with _stale_docker_resource_cleanup_lock:
+        if now_monotonic - _last_stale_docker_resource_cleanup_monotonic < cleanup_interval_seconds:
+            return
+        _last_stale_docker_resource_cleanup_monotonic = now_monotonic
+
+    max_age_seconds = _resolve_stale_sidecar_max_age_seconds(context)
+    stale_projects = _find_stale_copilot_projects(keep_project=keep_project, max_age_seconds=max_age_seconds)
+
+    removed_count = 0
+    for project in stale_projects:
+        if _teardown_stale_copilot_project(context, project=project):
+            removed_count += 1
+
+    if removed_count > 0:
+        emit_progress(
+            f"[copilot] cleaned {removed_count} stale orphaned stack"
+            f"{'s' if removed_count != 1 else ''} (max_age_seconds={max_age_seconds})",
+            component="copilot",
+        )
+
+
 def _resolve_proxy_service(context: RuntimeExecutionContext) -> str:
     for value in (
         _resolve_runtime_option(context, "copilot_proxy_service"),
@@ -432,6 +578,43 @@ def _resolve_swe_sandbox_image(context: RuntimeExecutionContext) -> str | None:
     return None
 
 
+def _resolve_dind_service(context: RuntimeExecutionContext) -> str:
+    for value in (
+        _resolve_runtime_option(context, "copilot_dind_service"),
+        os.getenv("SOMA_COPILOT_DIND_SERVICE"),
+        COPILOT_DEFAULT_DIND_SERVICE,
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return COPILOT_DEFAULT_DIND_SERVICE
+
+
+def _resolve_dind_image(context: RuntimeExecutionContext) -> str:
+    for value in (
+        _resolve_runtime_option(context, "copilot_dind_image"),
+        os.getenv("SOMA_COPILOT_DIND_IMAGE"),
+        COPILOT_DEFAULT_DIND_IMAGE,
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return COPILOT_DEFAULT_DIND_IMAGE
+
+
+def _isolated_docker_host(*, dind_service: str) -> str:
+    return f"tcp://{dind_service}:{COPILOT_DIND_PORT}"
+
+
+def _resolve_use_host_docker_socket(context: RuntimeExecutionContext) -> bool:
+    for value in (
+        _resolve_runtime_option(context, "copilot_use_host_docker_socket"),
+        os.getenv("SOMA_COPILOT_USE_HOST_DOCKER_SOCKET"),
+    ):
+        option = _coerce_bool_option(value)
+        if option is not None:
+            return option
+    return False
+
+
 def _host_docker_binary() -> str | None:
     docker_binary = shutil.which("docker")
     if docker_binary and os.path.isabs(docker_binary):
@@ -440,6 +623,12 @@ def _host_docker_binary() -> str | None:
 
 
 def _docker_socket_mount_args() -> list[str]:
+    """Bridge the agent straight to the host Docker daemon (legacy, insecure fallback).
+
+    Only used when SOMA_COPILOT_USE_HOST_DOCKER_SOCKET is set - the agent then sees and can
+    control every container on the host, not just its own SWE sandbox. The default path
+    (dind) never grants this.
+    """
     docker_sock = "/var/run/docker.sock"
     if not os.path.exists(docker_sock):
         raise RuntimeError(
@@ -452,6 +641,94 @@ def _docker_socket_mount_args() -> list[str]:
         args.extend(["-v", f"{docker_binary}:/usr/local/bin/docker:ro"])
 
     return args
+
+
+def _docker_image_exists(image_ref: str) -> bool:
+    return _run_command(["docker", "image", "inspect", image_ref]).returncode == 0
+
+
+def _ensure_docker_image_available(image_ref: str, *, role: str) -> None:
+    if _docker_image_exists(image_ref):
+        return
+
+    pull_result = _run_command(["docker", "pull", image_ref])
+    if pull_result.returncode == 0 and _docker_image_exists(image_ref):
+        return
+
+    message = (pull_result.stderr or pull_result.stdout or "").strip()
+    raise RuntimeError(
+        f"{role} Docker image is not available locally and automatic pull failed for {image_ref}: {message}"
+    )
+
+
+def _wait_for_dind_ready(*, dind_container_id: str) -> None:
+    last_error = ""
+    for _ in range(COPILOT_DIND_START_RETRIES):
+        probe = _run_command(["docker", "exec", dind_container_id, "docker", "info"])
+        if probe.returncode == 0:
+            return
+        last_error = (probe.stderr or probe.stdout or "").strip()
+        time.sleep(COPILOT_DIND_START_SLEEP_SECONDS)
+    raise RuntimeError(f"Copilot isolated Docker daemon (dind) did not become ready: {last_error}")
+
+
+def _ensure_image_in_isolated_daemon(*, dind_container_id: str, image: str, role: str) -> None:
+    if _run_command(["docker", "exec", dind_container_id, "docker", "image", "inspect", image]).returncode == 0:
+        return
+    if _run_command(["docker", "exec", dind_container_id, "docker", "pull", image]).returncode == 0:
+        if _run_command(["docker", "exec", dind_container_id, "docker", "image", "inspect", image]).returncode == 0:
+            return
+
+    _ensure_docker_image_available(image, role=role)
+    save_proc = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+    try:
+        load_proc = subprocess.run(
+            ["docker", "exec", "-i", dind_container_id, "docker", "load"],
+            stdin=save_proc.stdout,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        if save_proc.stdout is not None:
+            save_proc.stdout.close()
+        save_proc.wait()
+
+    if load_proc.returncode != 0 or save_proc.returncode != 0:
+        raise RuntimeError(
+            f"Failed to load {role} image {image!r} into the isolated Docker daemon: "
+            f"{(load_proc.stderr or load_proc.stdout or '').strip()}"
+        )
+
+
+def _start_nested_swe_sandbox(
+    *,
+    dind_container_id: str,
+    image: str,
+    container_name: str,
+    workspace_container_path: str,
+    repo_path: str,
+) -> str:
+    # Fresh dind per run, but guard against a leftover container from a crashed prior attempt.
+    _run_command(["docker", "exec", dind_container_id, "docker", "rm", "-f", container_name])
+    run_result = _run_command([
+        "docker", "exec", dind_container_id, "docker", "run", "-d",
+        "--name", container_name,
+        "-v", f"{workspace_container_path}:{repo_path}",
+        image,
+        "sh", "-lc", "while true; do sleep 3600; done",
+    ])
+    if run_result.returncode != 0:
+        raise RuntimeError(
+            "Failed to start Copilot SWE sandbox inside the isolated Docker daemon (dind). "
+            f"{(run_result.stderr or run_result.stdout or '').strip()}"
+        )
+    container_id = (run_result.stdout or "").strip()
+    if not container_id:
+        raise RuntimeError(
+            "Copilot SWE sandbox did not report a container id after starting inside the isolated Docker daemon."
+        )
+    return container_id
 
 
 def _resolve_proxy_port(context: RuntimeExecutionContext, *, proxy_service: str) -> int:
@@ -1297,10 +1574,22 @@ def _build_prompt(context: RuntimeExecutionContext) -> str:
     if _resolve_swe_sandbox_enabled(context) and _resolve_swe_sandbox_image(context):
         prompt = (
             f"{prompt}\n\n"
-            "SWE sandbox is available for command execution. "
-            "Run task-environment commands using docker exec against "
-            "$SWE_BENCH_SANDBOX_CONTAINER_NAME (or $SWE_BENCH_SANDBOX_CONTAINER_ID). "
-            "The repository path inside sandbox is $SWE_BENCH_SANDBOX_REPO_PATH."
+            "The repository is checked out locally at $SWE_BENCH_SANDBOX_REPO_PATH "
+            "(your current working directory) - read and edit files there directly "
+            "with your normal file tools. "
+            "A separate SWE sandbox container with the task environment's dependencies "
+            "installed is available for running commands (tests, scripts, etc.): "
+            "use docker exec against $SWE_BENCH_SANDBOX_CONTAINER_NAME (or "
+            "$SWE_BENCH_SANDBOX_CONTAINER_ID), which sees the same files at the same path."
+        )
+
+    if _resolve_network_isolation_enabled(context):
+        prompt = (
+            f"{prompt}\n\n"
+            "You have no internet access in this environment. Do not attempt to install "
+            "packages (pip/apt/npm/etc.), download files, or reach any external host - "
+            "these will fail. Work only with what is already present in the repository "
+            "and the task environment."
         )
     return prompt
 
@@ -1391,10 +1680,14 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     proxy_service = _resolve_proxy_service(context)
     proxy_port = _resolve_proxy_port(context, proxy_service=proxy_service)
     compose_project = _resolve_compose_project_name(context)
+    _maybe_cleanup_stale_copilot_docker_resources(context, keep_project=compose_project)
     swe_sandbox_enabled = _resolve_swe_sandbox_enabled(context)
     swe_sandbox_service = _resolve_swe_sandbox_service(context)
     swe_sandbox_repo_path = _resolve_swe_sandbox_repo_path(context)
     swe_sandbox_image = _resolve_swe_sandbox_image(context)
+    dind_service = _resolve_dind_service(context)
+    dind_image = _resolve_dind_image(context)
+    use_host_docker_socket = _resolve_use_host_docker_socket(context)
     shared_proxy_mode = _resolve_shared_proxy_batch_enabled(context)
     compose_swe_sandbox_enabled = (
         swe_sandbox_enabled
@@ -1419,7 +1712,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         include_proxy=network_isolation,
     )
     if compose_swe_sandbox_enabled:
-        stack_services.append(swe_sandbox_service)
+        stack_services.append(swe_sandbox_service if use_host_docker_socket else dind_service)
     prompt = _build_prompt(context)
 
     # New checkouts live outside output artifacts; remove empty legacy folder if present.
@@ -1501,7 +1794,10 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     workspace_volume = _seed_workspace_volume(compose_project=compose_project, repo_root=repo_root)
     env["COPILOT_WORKSPACE_VOLUME_NAME"] = workspace_volume
     if compose_swe_sandbox_enabled:
-        env["COPILOT_SWE_SANDBOX_IMAGE"] = swe_sandbox_image
+        if use_host_docker_socket:
+            env["COPILOT_SWE_SANDBOX_IMAGE"] = swe_sandbox_image
+        else:
+            env["COPILOT_DIND_IMAGE"] = dind_image
     if network_isolation:
         base_url_raw = str(context.llm_config.get("base_url", "")).strip()
         if not base_url_raw:
@@ -1569,7 +1865,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                     proxy_service=proxy_service,
                 )
 
-        if compose_swe_sandbox_enabled:
+        if compose_swe_sandbox_enabled and use_host_docker_socket:
             sandbox_ps = _run_command(
                 [*compose_prefix, "ps", "-q", swe_sandbox_service],
                 cwd=repo_root,
@@ -1587,6 +1883,8 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             if not swe_sandbox_container_name:
                 swe_sandbox_container_name = swe_sandbox_container_id
 
+            # Legacy bridge: the agent gets the HOST docker.sock directly, so it can see
+            # and control every container on the host, not just this SWE sandbox.
             env["SWE_BENCH_SANDBOX_CONTAINER_ID"] = swe_sandbox_container_id
             env["SWE_BENCH_SANDBOX_CONTAINER_NAME"] = swe_sandbox_container_name
             env["SWE_BENCH_SANDBOX_REPO_PATH"] = swe_sandbox_repo_path
@@ -1600,6 +1898,54 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 "-e",
                 "SWE_BENCH_SANDBOX_REPO_PATH",
             ])
+        elif compose_swe_sandbox_enabled:
+            dind_ps = _run_command(
+                [*compose_prefix, "ps", "-q", dind_service],
+                cwd=repo_root,
+                env=env,
+            )
+            dind_container_id = (dind_ps.stdout or "").strip().splitlines()[0] if (dind_ps.stdout or "").strip() else ""
+            if not dind_container_id:
+                raise RuntimeError(
+                    "Copilot isolated Docker daemon (dind) is not running after compose up. "
+                    f"{(dind_ps.stderr or dind_ps.stdout or '').strip()}"
+                )
+            _wait_for_dind_ready(dind_container_id=dind_container_id)
+            _ensure_image_in_isolated_daemon(
+                dind_container_id=dind_container_id,
+                image=swe_sandbox_image,
+                role="Copilot SWE sandbox",
+            )
+            swe_sandbox_container_name = swe_sandbox_service
+            swe_sandbox_container_id = _start_nested_swe_sandbox(
+                dind_container_id=dind_container_id,
+                image=swe_sandbox_image,
+                container_name=swe_sandbox_container_name,
+                workspace_container_path=COPILOT_DIND_WORKSPACE_MOUNT,
+                repo_path=swe_sandbox_repo_path,
+            )
+
+            # The agent reaches the sandbox only through the isolated dind daemon's
+            # Docker API (DOCKER_HOST over the internal network) - never the host socket.
+            # DOCKER_HOST must NOT go into `env`: that dict is also the subprocess
+            # environment for the host-side `docker compose` invocations below, and
+            # docker's CLI itself honors DOCKER_HOST - setting it there would redirect
+            # compose's own host-side calls (ps/up/down) at the isolated daemon too.
+            env["SWE_BENCH_SANDBOX_CONTAINER_ID"] = swe_sandbox_container_id
+            env["SWE_BENCH_SANDBOX_CONTAINER_NAME"] = swe_sandbox_container_name
+            env["SWE_BENCH_SANDBOX_REPO_PATH"] = swe_sandbox_repo_path
+            run_container_args.extend([
+                "-e",
+                f"DOCKER_HOST={_isolated_docker_host(dind_service=dind_service)}",
+                "-e",
+                "SWE_BENCH_SANDBOX_CONTAINER_ID",
+                "-e",
+                "SWE_BENCH_SANDBOX_CONTAINER_NAME",
+                "-e",
+                "SWE_BENCH_SANDBOX_REPO_PATH",
+            ])
+
+        if compose_swe_sandbox_enabled:
             command = [
                 *compose_prefix,
                 "run",
@@ -1672,7 +2018,10 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             )
     finally:
         if stack_up_attempted:
-            sidecar_services = [service_name for service_name in {proxy_service, COPILOT_DEFAULT_PROXY_SERVICE, "compression-service"}]
+            sidecar_service_names = {proxy_service, COPILOT_DEFAULT_PROXY_SERVICE, "compression-service"}
+            if compose_swe_sandbox_enabled:
+                sidecar_service_names.add(swe_sandbox_service if use_host_docker_socket else dind_service)
+            sidecar_services = [service_name for service_name in sidecar_service_names]
             sidecar_log_paths = _collect_compose_service_logs(
                 compose_prefix=compose_prefix,
                 cwd=repo_root,
@@ -1737,6 +2086,9 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "swe_sandbox_container_id": swe_sandbox_container_id,
         "swe_sandbox_container_name": swe_sandbox_container_name,
         "swe_sandbox_repo_path": swe_sandbox_repo_path,
+        "dind_service": dind_service,
+        "dind_image": dind_image,
+        "docker_bridge_mode": "host-socket" if use_host_docker_socket else "dind",
         "stack_up_stdout": stack_up_stdout,
         "stack_up_stderr": stack_up_stderr,
         "stack_down_stdout": stack_down_stdout,

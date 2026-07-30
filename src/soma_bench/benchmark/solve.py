@@ -329,6 +329,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--copilot-use-host-docker-socket",
+        action="store_true",
+        help=(
+            "Legacy/insecure fallback: bridge the Copilot agent to the SWE sandbox by mounting "
+            "the HOST Docker socket directly, instead of the default isolated dind daemon. "
+            "The agent can then see and control every container on the host, not just its own "
+            "sandbox - only use this if the isolated dind daemon does not work in your environment "
+            "(e.g. nested privileged containers are unsupported)."
+        ),
+    )
+    parser.add_argument(
         "--benchmark-type",
         choices=list(BENCHMARK_TYPES),
         default=BENCHMARK_TYPE_SWEBENCH_VERIFIED,
@@ -451,6 +462,7 @@ def main(argv: list[str] | None = None) -> int:
         copilot_compression_script_path=args.copilot_compression_script_path,
         copilot_compression_service_autobuild=args.copilot_compression_service_autobuild,
         copilot_compression_service_build_context=args.copilot_compression_service_build_context,
+        copilot_use_host_docker_socket=args.copilot_use_host_docker_socket,
     )
 
     if args.benchmark_type in (BENCHMARK_TYPE_SWE_EXPLORER_EDIT, BENCHMARK_TYPE_SWE_EXPLORER_EXPLORE):

@@ -67,6 +67,34 @@ def resolve_benchmark_runtime_image(
     )
 
 
+DEFAULT_PREBAKED_DIND_REPO_ENV = "SOMA_SWEBENCH_DIND_PREBAKED_REPO"
+
+
+def derive_prebaked_dind_tag(instance_id: str) -> str:
+    # SWE-bench instance IDs (e.g. "django__django-11551") are already legal Docker tag
+    # characters ([a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}); this is a tag, not a repo path
+    # segment, so - unlike derive_swebench_instance_image - no "__" -> "_1776_" mangling.
+    return instance_id.lower()
+
+
+def derive_prebaked_dind_image(instance_id: str, *, repo: str) -> str:
+    return f"{repo}:{derive_prebaked_dind_tag(instance_id)}"
+
+
+def resolve_prebaked_dind_repo(runtime_options: Mapping[str, Any] | None = None) -> str | None:
+    raw_value: Any = None
+    if runtime_options and "swebench_dind_prebaked_repo" in runtime_options:
+        raw_value = runtime_options["swebench_dind_prebaked_repo"]
+    elif DEFAULT_PREBAKED_DIND_REPO_ENV in os.environ:
+        raw_value = os.getenv(DEFAULT_PREBAKED_DIND_REPO_ENV)
+
+    if isinstance(raw_value, str):
+        repo = raw_value.strip()
+        return repo or None
+
+    return None
+
+
 def enrich_hidden_eval_with_runtime_image(
     *,
     instance_id: str,

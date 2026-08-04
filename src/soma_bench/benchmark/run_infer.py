@@ -40,6 +40,7 @@ def _build_runtime_options(
     copilot_compression_script_path: str | None,
     copilot_compression_service_autobuild: bool,
     copilot_compression_service_build_context: str | None,
+    copilot_use_host_docker_socket: bool = False,
 ) -> dict[str, Any]:
     runtime_options: dict[str, Any] = {}
     if openclaw_command:
@@ -84,6 +85,8 @@ def _build_runtime_options(
         runtime_options["copilot_compression_service_build_context"] = (
             copilot_compression_service_build_context
         )
+    if copilot_use_host_docker_socket:
+        runtime_options["copilot_use_host_docker_socket"] = True
     return runtime_options
 
 
@@ -240,6 +243,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--copilot-use-host-docker-socket",
+        action="store_true",
+        help=(
+            "Legacy/insecure fallback: bridge the Copilot agent to the SWE sandbox by mounting "
+            "the HOST Docker socket directly, instead of the default isolated dind daemon. "
+            "The agent can then see and control every container on the host, not just its own "
+            "sandbox - only use this if the isolated dind daemon does not work in your environment "
+            "(e.g. nested privileged containers are unsupported)."
+        ),
+    )
+    parser.add_argument(
         "--swerebench-eval",
         action="store_true",
         help="After agent execution, export the resulting patch and run SWE-rebench evaluation through swebench.harness.",
@@ -312,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         copilot_compression_script_path=args.copilot_compression_script_path,
         copilot_compression_service_autobuild=args.copilot_compression_service_autobuild,
         copilot_compression_service_build_context=args.copilot_compression_service_build_context,
+        copilot_use_host_docker_socket=args.copilot_use_host_docker_socket,
     )
     run_plan = build_run_plan(
         instances,

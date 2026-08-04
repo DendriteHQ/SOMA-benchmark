@@ -5,9 +5,9 @@ services:
     pull_policy: never
     env_file:
       - .env
-    working_dir: /workspace
+    working_dir: /testbed
     volumes:
-      - copilot-workspace:/workspace
+      - copilot-workspace:/testbed
       - copilot-home:/home/copilot
     networks:
       - copilot-sandbox
@@ -56,6 +56,21 @@ services:
     networks:
       - copilot-sandbox
 
+  dind:
+    image: ${COPILOT_DIND_IMAGE:-docker:dind}
+    privileged: true
+    environment:
+      - DOCKER_TLS_CERTDIR=
+    volumes:
+      - copilot-workspace:/workspace
+    profiles:
+      - copilot-sidecars
+    networks:
+      - copilot-sandbox
+
+  # Legacy bridge: only started when SOMA_COPILOT_USE_HOST_DOCKER_SOCKET is set.
+  # Runs directly on the host engine, reachable via the host docker.sock mounted
+  # into the copilot container - no isolation from other host containers.
   swe-sandbox:
     image: ${COPILOT_SWE_SANDBOX_IMAGE:-alpine:3.20}
     volumes:

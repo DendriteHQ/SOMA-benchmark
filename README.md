@@ -218,6 +218,7 @@ env var, which takes precedence over the built-in default.
 | `SOMA_COPILOT_NETWORK_ISOLATION` | `true` | Run the CLI container without direct internet, routed through the proxy sidecar |
 | `SOMA_COPILOT_KEEP_STACK` | `false` | Keep the Compose stack up after the run instead of tearing it down |
 | `SOMA_COPILOT_SWE_SANDBOX` | `true` | Start a read-only sandbox container exposing the SWE-bench image's `/testbed` |
+| `SOMA_COPILOT_USE_HOST_DOCKER_SOCKET` (`--copilot-use-host-docker-socket`) | `false` | By default the SWE sandbox runs inside an isolated `dind` daemon, unreachable from the host and invisible to it. Setting this bridges the agent to the sandbox via the **host** Docker socket instead - the agent then sees and can control every container on the host, not just its own sandbox. Legacy/insecure fallback only; use if the isolated dind daemon doesn't work in your environment. |
 | `SOMA_COPILOT_SHARED_PROXY` | `true` | Reuse one proxy/compression stack across a batch instead of one per instance |
 
 ### Output layout

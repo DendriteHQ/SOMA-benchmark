@@ -18,8 +18,11 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from ..base import RuntimeBackend, RuntimeExecutionContext, RuntimeExecutionResult
+from ... import dind_utils
 from ...swerebench_eval import capture_repo_patch
 from ...progress import emit_progress
+from ...registry_auth import docker_env_for_image, uses_token_auth
+from ...swebench_images import derive_prebaked_dind_image, resolve_prebaked_dind_repo
 
 COPILOT_WORKSPACE_ERROR = (
     "Copilot backend currently supports only docker workspace execution. "
@@ -42,8 +45,6 @@ COPILOT_DEFAULT_DIND_SERVICE = "dind"
 COPILOT_DEFAULT_DIND_IMAGE = "docker:dind"
 COPILOT_DIND_PORT = 2375
 COPILOT_DIND_WORKSPACE_MOUNT = "/workspace"
-COPILOT_DIND_START_RETRIES = 60
-COPILOT_DIND_START_SLEEP_SECONDS = 0.5
 COPILOT_WORKSPACE_VOLUME_BASENAME = "copilot-workspace"
 COPILOT_DEFAULT_IMAGE = "local/copilot-cli:latest"
 COPILOT_DEFAULT_NETWORK_ISOLATION = True
@@ -643,62 +644,51 @@ def _docker_socket_mount_args() -> list[str]:
     return args
 
 
-def _docker_image_exists(image_ref: str) -> bool:
-    return _run_command(["docker", "image", "inspect", image_ref]).returncode == 0
+def _resolve_prebaked_dind_repo(context: RuntimeExecutionContext) -> str | None:
+    return resolve_prebaked_dind_repo(_resolve_runtime_options(context))
 
 
-def _ensure_docker_image_available(image_ref: str, *, role: str) -> None:
-    if _docker_image_exists(image_ref):
-        return
-
-    pull_result = _run_command(["docker", "pull", image_ref])
-    if pull_result.returncode == 0 and _docker_image_exists(image_ref):
-        return
-
-    message = (pull_result.stderr or pull_result.stdout or "").strip()
-    raise RuntimeError(
-        f"{role} Docker image is not available locally and automatic pull failed for {image_ref}: {message}"
+def _try_pull_docker_image(image_ref: str) -> bool:
+    # Auth comes from DOCKERHUB_USERNAME/DOCKERHUB_TOKEN via a process-private DOCKER_CONFIG
+    # (see registry_auth.py), so a private prebaked repo pulls on any host without a prior
+    # `docker login` - and without depending on ~/.docker/config.json staying valid.
+    result = _run_command(["docker", "pull", image_ref], env=docker_env_for_image(image_ref))
+    if result.returncode == 0:
+        return True
+    auth_mode = "DOCKERHUB_USERNAME/DOCKERHUB_TOKEN" if uses_token_auth(image_ref) else "ambient docker config"
+    emit_progress(
+        f"[copilot] pull failed for prebaked dind image {image_ref!r} (auth: {auth_mode}): "
+        f"{(result.stderr or result.stdout or '').strip()}",
+        component="copilot",
     )
+    return False
 
 
-def _wait_for_dind_ready(*, dind_container_id: str) -> None:
-    last_error = ""
-    for _ in range(COPILOT_DIND_START_RETRIES):
-        probe = _run_command(["docker", "exec", dind_container_id, "docker", "info"])
-        if probe.returncode == 0:
-            return
-        last_error = (probe.stderr or probe.stdout or "").strip()
-        time.sleep(COPILOT_DIND_START_SLEEP_SECONDS)
-    raise RuntimeError(f"Copilot isolated Docker daemon (dind) did not become ready: {last_error}")
+def _resolve_effective_dind_image(
+    context: RuntimeExecutionContext,
+    *,
+    swe_sandbox_image: str,
+    default_dind_image: str,
+) -> str:
+    dind_image = _resolve_dind_image(context)
+    if dind_image != COPILOT_DEFAULT_DIND_IMAGE:
+        # Explicit override (runtime option or SOMA_COPILOT_DIND_IMAGE) always wins.
+        return dind_image
 
+    repo = _resolve_prebaked_dind_repo(context)
+    if not repo:
+        return default_dind_image
 
-def _ensure_image_in_isolated_daemon(*, dind_container_id: str, image: str, role: str) -> None:
-    if _run_command(["docker", "exec", dind_container_id, "docker", "image", "inspect", image]).returncode == 0:
-        return
-    if _run_command(["docker", "exec", dind_container_id, "docker", "pull", image]).returncode == 0:
-        if _run_command(["docker", "exec", dind_container_id, "docker", "image", "inspect", image]).returncode == 0:
-            return
+    candidate = derive_prebaked_dind_image(context.instance.instance_id, repo=repo)
+    if dind_utils.docker_image_exists(candidate) or _try_pull_docker_image(candidate):
+        return candidate
 
-    _ensure_docker_image_available(image, role=role)
-    save_proc = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
-    try:
-        load_proc = subprocess.run(
-            ["docker", "exec", "-i", dind_container_id, "docker", "load"],
-            stdin=save_proc.stdout,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    finally:
-        if save_proc.stdout is not None:
-            save_proc.stdout.close()
-        save_proc.wait()
-
-    if load_proc.returncode != 0 or save_proc.returncode != 0:
-        raise RuntimeError(
-            f"Failed to load {role} image {image!r} into the isolated Docker daemon: "
-            f"{(load_proc.stderr or load_proc.stdout or '').strip()}"
-        )
+    emit_progress(
+        f"[copilot] prebaked dind image {candidate!r} unavailable; "
+        "falling back to on-demand save/load into a plain dind daemon.",
+        component="copilot",
+    )
+    return default_dind_image
 
 
 def _start_nested_swe_sandbox(
@@ -1797,6 +1787,11 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         if use_host_docker_socket:
             env["COPILOT_SWE_SANDBOX_IMAGE"] = swe_sandbox_image
         else:
+            dind_image = _resolve_effective_dind_image(
+                context,
+                swe_sandbox_image=swe_sandbox_image,
+                default_dind_image=dind_image,
+            )
             env["COPILOT_DIND_IMAGE"] = dind_image
     if network_isolation:
         base_url_raw = str(context.llm_config.get("base_url", "")).strip()
@@ -1910,8 +1905,8 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                     "Copilot isolated Docker daemon (dind) is not running after compose up. "
                     f"{(dind_ps.stderr or dind_ps.stdout or '').strip()}"
                 )
-            _wait_for_dind_ready(dind_container_id=dind_container_id)
-            _ensure_image_in_isolated_daemon(
+            dind_utils.wait_for_dind_ready(dind_container_id=dind_container_id)
+            dind_utils.ensure_image_in_isolated_daemon(
                 dind_container_id=dind_container_id,
                 image=swe_sandbox_image,
                 role="Copilot SWE sandbox",

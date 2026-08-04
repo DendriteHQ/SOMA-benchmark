@@ -37,6 +37,12 @@ def main() -> int:
         add_help=False,
     )
 
+    benchmark_prebake_dind_images = subparsers.add_parser(
+        "benchmark-prebake-dind-images",
+        help="Pre-bake SWE-bench sandbox images into dind images and push them to Docker Hub.",
+        add_help=False,
+    )
+
     args, extras = parser.parse_known_args()
     if args.command == "info":
         if extras:
@@ -62,6 +68,10 @@ def main() -> int:
         from soma_bench.benchmark.eval_infer import main as benchmark_eval_main
 
         return benchmark_eval_main(extras)
+    if args.command == "benchmark-prebake-dind-images":
+        from soma_bench.benchmark.swebench_dind_prebake import main as benchmark_prebake_dind_images_main
+
+        return benchmark_prebake_dind_images_main(extras)
     raise ValueError(f"Unsupported command: {args.command}")
 
 

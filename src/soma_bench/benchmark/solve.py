@@ -42,7 +42,8 @@ BENCHMARK_TYPES = (
 _SWE_EXPLORER_BENCHMARK_NAME = "SWE-Explore-Bench/SWE-Explore-Bench"
 _SWE_EXPLORER_EXPLORE_TOP_K = 20
 
-_SWE_EXPLORER_EXPLORE_RESULT_FILE = "/workspace/explore-result.json"
+
+_SWE_EXPLORER_EXPLORE_RESULT_FILE = "explore-result.json"
 
 _SWE_EXPLORER_EXPLORE_TEMPLATE = """\
 You are a code exploration specialist. Explore this repository to find the
@@ -52,9 +53,10 @@ following issue. Do NOT make any code changes.
 Use Glob, Grep, and Read tools to explore the codebase. Focus on finding
 the ROOT CAUSE, not just symptom locations.
 
-When you have finished exploring, write your findings to the file
-`{result_file}` using the Write tool. The file must contain ONLY a JSON
-array in exactly this format (no markdown, no explanation, no extra text):
+When you have finished exploring, write your findings to `{result_file}` in the
+repository root (your current working directory) using the Write tool. The file
+must contain ONLY a JSON array in exactly this format (no markdown, no
+explanation, no extra text):
 
 [
   {{"path": "path/to/file1.py", "start": 10, "end": 50}},
@@ -63,7 +65,7 @@ array in exactly this format (no markdown, no explanation, no extra text):
 
 Focus on the root cause. Limit to top {top_k} most relevant regions.
 Use relative paths from the repository root (e.g. "django/db/models/base.py"),
-not absolute paths starting with /workspace/.
+not absolute container paths (e.g. "/testbed/django/db/models/base.py").
 
 Expected coverage: aim to find {n_source} source file(s) and {n_test} test file(s).
 

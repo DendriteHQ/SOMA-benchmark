@@ -878,7 +878,67 @@ def _workspace_volume_name(*, compose_project: str) -> str:
     return f"{compose_project}_{COPILOT_WORKSPACE_VOLUME_BASENAME}"
 
 
-def _seed_workspace_volume(*, compose_project: str, repo_root: Path) -> str:
+def _resolve_compose_service_image(
+    *,
+    compose_file: Path,
+    compose_project: str,
+    service: str,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Image Compose will actually run for `service` (falls back to the built-in default)."""
+    result = _run_command(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(compose_file),
+            "--project-name",
+            compose_project,
+            "config",
+            "--images",
+            service,
+        ],
+        env=env,
+    )
+    if result.returncode == 0:
+        for line in (result.stdout or "").splitlines():
+            candidate = line.strip()
+            if candidate:
+                return candidate
+    emit_progress(
+        f"[copilot] could not resolve the image for compose service {service!r}; "
+        f"assuming {COPILOT_DEFAULT_IMAGE}",
+        component="copilot",
+    )
+    return COPILOT_DEFAULT_IMAGE
+
+
+def _resolve_image_user(image: str) -> tuple[int, int] | None:
+    """Numeric uid:gid the agent CLI runs as inside `image`, or None if unresolvable.
+
+    `docker image inspect` only reports the configured user *name* (`copilot`), so the
+    id has to be read from inside the image itself.
+    """
+    result = _run_command(
+        ["docker", "run", "--rm", "--entrypoint", "sh", image, "-c", "id -u; id -g"]
+    )
+    ids = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if result.returncode != 0 or len(ids) < 2 or not all(value.isdigit() for value in ids[:2]):
+        emit_progress(
+            f"[copilot] could not resolve the container user of {image!r}: "
+            f"{(result.stderr or result.stdout or '').strip()}",
+            component="copilot",
+        )
+        return None
+    return int(ids[0]), int(ids[1])
+
+
+def _seed_workspace_volume(
+    *,
+    compose_project: str,
+    repo_root: Path,
+    owner: tuple[int, int] | None = None,
+) -> str:
     volume_name = _workspace_volume_name(compose_project=compose_project)
     _run_command(["docker", "volume", "rm", "-f", volume_name])
     create_result = _run_command(["docker", "volume", "create", volume_name])
@@ -887,6 +947,14 @@ def _seed_workspace_volume(*, compose_project: str, repo_root: Path) -> str:
             "Failed to create Copilot workspace Docker volume. "
             f"{(create_result.stderr or create_result.stdout or '').strip()}"
         )
+
+    # The copy runs as root, which would leave the whole workspace root-owned - the agent
+    # CLI runs as a non-root user (`USER copilot`), so its file tools would then fail with
+    # EACCES on every write under the repo. Handing ownership to that user keeps the agent
+    # unprivileged instead of granting it root.
+    seed_script = "rm -rf /workspace/* /workspace/.[!.]* /workspace/..?* 2>/dev/null || true; cp -a /src/. /workspace/"
+    if owner is not None:
+        seed_script += f"; chown -R {owner[0]}:{owner[1]} /workspace"
 
     copy_result = _run_command(
         [
@@ -900,7 +968,7 @@ def _seed_workspace_volume(*, compose_project: str, repo_root: Path) -> str:
             "alpine:3.20",
             "sh",
             "-lc",
-            "rm -rf /workspace/* /workspace/.[!.]* /workspace/..?* 2>/dev/null || true; cp -a /src/. /workspace/",
+            seed_script,
         ]
     )
     if copy_result.returncode != 0:
@@ -1781,7 +1849,24 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         else:
             env["COMPOSE_PROFILES"] = "copilot-sidecars"
 
-    workspace_volume = _seed_workspace_volume(compose_project=compose_project, repo_root=repo_root)
+    agent_image = _resolve_compose_service_image(
+        compose_file=compose_file,
+        compose_project=compose_project,
+        service=service,
+        env=env,
+    )
+    workspace_owner = _resolve_image_user(agent_image)
+    if workspace_owner is not None:
+        emit_progress(
+            f"[{context.instance.instance_id}] seeding workspace owned by "
+            f"{workspace_owner[0]}:{workspace_owner[1]} (agent user in {agent_image})",
+            component="copilot",
+        )
+    workspace_volume = _seed_workspace_volume(
+        compose_project=compose_project,
+        repo_root=repo_root,
+        owner=workspace_owner,
+    )
     env["COPILOT_WORKSPACE_VOLUME_NAME"] = workspace_volume
     if compose_swe_sandbox_enabled:
         if use_host_docker_socket:

@@ -262,7 +262,13 @@ def capture_repo_patch(
         patch_path.write_text("", encoding="utf-8")
         return payload
 
-    add_result = _run_command(["git", "-C", str(repo_dir), "add", "-N", "--all"])
+    # The snapshot is copied out of the agent's workspace with ownership preserved, so this
+    # repo is normally owned by the agent's container user while we run as root here. Git
+    # would refuse that with "detected dubious ownership" - the snapshot is our own artifact,
+    # not a shared checkout, so trusting it is safe.
+    git_prefix = ["git", "-c", f"safe.directory={repo_dir}", "-C", str(repo_dir)]
+
+    add_result = _run_command([*git_prefix, "add", "-N", "--all"])
     if add_result.returncode != 0:
         payload["status"] = "error"
         payload["error"] = (add_result.stderr or add_result.stdout or "git add -N failed").strip()
@@ -271,9 +277,7 @@ def capture_repo_patch(
 
     diff_result = _run_command(
         [
-            "git",
-            "-C",
-            str(repo_dir),
+            *git_prefix,
             "-c",
             "core.fileMode=false",
             "diff",

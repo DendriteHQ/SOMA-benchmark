@@ -11,8 +11,9 @@ services:
       - copilot-home:/home/copilot
     networks:
       - copilot-sandbox
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # Deliberately no extra_hosts: the agent has no business addressing the host. See the
+    # gateway_mode_ipv4 note on copilot-sandbox below - `internal: true` alone does not stop
+    # it from reaching host services on the bridge gateway.
     stdin_open: true
     tty: true
 
@@ -60,13 +61,54 @@ services:
     image: ${COPILOT_DIND_IMAGE:-docker:dind}
     privileged: true
     environment:
-      - DOCKER_TLS_CERTDIR=
+      - DOCKER_TLS_CERTDIR=${COPILOT_DIND_TLS_CERTDIR-/certs}
     volumes:
       - copilot-workspace:/workspace
+      - copilot-dind-certs:/certs/client
+    profiles:
+      - copilot-sidecars
+    networks:
+      copilot-dind:
+        aliases:
+          - docker
+
+  swe-exec-broker:
+    image: ${COPILOT_SWE_EXEC_BROKER_IMAGE:-soma-compression-service:latest}
+    entrypoint:
+      - python
+      - /app/swe_exec_broker.py
+    environment:
+      - SWE_EXEC_BROKER_TOKEN=${COPILOT_SWE_EXEC_BROKER_TOKEN:-}
+      - SWE_EXEC_BROKER_PORT=${COPILOT_SWE_EXEC_BROKER_PORT:-8100}
+      - SWE_EXEC_SANDBOX_CONTAINER=${COPILOT_SWE_EXEC_SANDBOX_CONTAINER:-}
+      - SWE_EXEC_SANDBOX_REPO_PATH=${COPILOT_SWE_SANDBOX_REPO_PATH:-/testbed}
+      - SWE_EXEC_SANDBOX_ENV_BIN_DIR=${COPILOT_SWE_EXEC_SANDBOX_ENV_BIN_DIR:-}
+      - SWE_EXEC_DIND_HOST=${COPILOT_DIND_HOSTNAME:-docker}
+      - SWE_EXEC_DIND_PORT=${COPILOT_DIND_PORT:-2376}
+      - SWE_EXEC_TIMEOUT_SECONDS=${COPILOT_SWE_EXEC_TIMEOUT_SECONDS:-900}
+    volumes:
+      - ${COPILOT_SWE_EXEC_BROKER_SCRIPT_PATH:-/dev/null}:/app/swe_exec_broker.py:ro
+      - copilot-dind-certs:/certs/client:ro
+    # Overrides the base image's healthcheck, which probes the compression service's
+    # /health on $PORT - an endpoint and a port this container does not have, so it would
+    # sit permanently unhealthy and mask a genuine failure.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${COPILOT_SWE_EXEC_BROKER_PORT:-8100}/healthz', timeout=2)" || exit 1
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 6
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     profiles:
       - copilot-sidecars
     networks:
       - copilot-sandbox
+      - copilot-dind
 
   # Legacy bridge: only started when SOMA_COPILOT_USE_HOST_DOCKER_SOCKET is set.
   # Runs directly on the host engine, reachable via the host docker.sock mounted
@@ -86,6 +128,9 @@ services:
 
 volumes:
   copilot-home:
+  # Compose-managed (not external), so `down --volumes` removes it with the stack and the
+  # dind client certificate never outlives the run it was generated for.
+  copilot-dind-certs:
   copilot-workspace:
     external: true
     name: ${COPILOT_WORKSPACE_VOLUME_NAME}
@@ -93,4 +138,10 @@ volumes:
 networks:
   copilot-sandbox:
     internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: ${COPILOT_SANDBOX_GATEWAY_MODE:-isolated}
+  copilot-dind:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: ${COPILOT_SANDBOX_GATEWAY_MODE:-isolated}
   copilot-egress:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -43,8 +44,36 @@ COPILOT_DEFAULT_SWE_SANDBOX_SERVICE = "swe-sandbox"
 COPILOT_DEFAULT_SWE_SANDBOX_REPO_PATH = "/testbed"
 COPILOT_DEFAULT_DIND_SERVICE = "dind"
 COPILOT_DEFAULT_DIND_IMAGE = "docker:dind"
-COPILOT_DIND_PORT = 2375
+# 2376 is dind's mutual-TLS port. The plaintext 2375 listener only exists when TLS is
+# explicitly disabled via SOMA_COPILOT_DIND_TLS=false, which is not the supported path.
+COPILOT_DIND_TLS_PORT = 2376
+COPILOT_DIND_PLAINTEXT_PORT = 2375
+COPILOT_DIND_CLIENT_CERT_DIR = "/certs/client"
+# dind's entrypoint issues its server certificate for "docker", "localhost" and the
+# container hostname - never for the compose service name. Clients must therefore address
+# the daemon as "docker" (compose publishes that network alias) to keep TLS hostname
+# verification enabled instead of disabling it.
+COPILOT_DIND_TLS_HOSTNAME = "docker"
+COPILOT_DEFAULT_DIND_TLS = True
+# dind's own default. Passed through to the daemon explicitly (the compose `dind` service
+# declares it) rather than relied upon, so that the TLS-off path can send an empty value.
+COPILOT_DIND_TLS_CERTDIR = "/certs"
+# Bridge networks marked `internal` still hand containers a gateway address, and that
+# address is the host - packets to it land in INPUT, which the internal-network DROP rules
+# (FORWARD only) never inspect. `isolated` (Docker >= 28) allocates no gateway at all, which
+# is what actually makes the host unreachable. `nat` restores the old, reachable behavior
+# for engines too old to support it.
+COPILOT_SANDBOX_GATEWAY_MODE_ISOLATED = "isolated"
+COPILOT_SANDBOX_GATEWAY_MODE_NAT = "nat"
+COPILOT_DEFAULT_SANDBOX_GATEWAY_MODE = COPILOT_SANDBOX_GATEWAY_MODE_ISOLATED
 COPILOT_DIND_WORKSPACE_MOUNT = "/workspace"
+COPILOT_SWE_EXEC_BROKER_SERVICE = "swe-exec-broker"
+COPILOT_DEFAULT_SWE_EXEC_BROKER = True
+COPILOT_DEFAULT_SWE_EXEC_BROKER_PORT = 8100
+COPILOT_DEFAULT_SWE_EXEC_TIMEOUT_SECONDS = 900
+COPILOT_SWE_EXEC_BROKER_READY_RETRIES = 60
+COPILOT_SWE_EXEC_BROKER_READY_SLEEP_SECONDS = 0.5
+COPILOT_SWE_EXEC_CLIENT_CONTAINER_PATH = "/usr/local/bin/swe-exec"
 COPILOT_WORKSPACE_VOLUME_BASENAME = "copilot-workspace"
 COPILOT_DEFAULT_IMAGE = "local/copilot-cli:latest"
 COPILOT_DEFAULT_NETWORK_ISOLATION = True
@@ -71,7 +100,20 @@ _last_run_root_cleanup_monotonic = 0.0
 _stale_docker_resource_cleanup_lock = threading.Lock()
 _last_stale_docker_resource_cleanup_monotonic = 0.0
 _COMPOSE_PROJECT_CONTAINER_RE = re.compile(
-    r"^(" + re.escape(COPILOT_PROJECT_NAME_PREFIX) + r"[0-9a-f]+)-(dind|proxy|compression-service)-\S+$"
+    r"^(" + re.escape(COPILOT_PROJECT_NAME_PREFIX) + r"[0-9a-f]+)"
+    r"-(dind|proxy|compression-service|swe-exec-broker)-\S+$"
+)
+# Networks and volumes outlive containers: `compose down` removing the containers and then
+# failing (or being killed) partway leaves these behind, and nothing that enumerates
+# containers can see them again. Each orphan holds a /16 out of Docker's finite address
+# pool and a workspace volume now seeded from the task image, so they cannot be ignored.
+_COMPOSE_PROJECT_NETWORK_RE = re.compile(
+    r"^(" + re.escape(COPILOT_PROJECT_NAME_PREFIX) + r"[0-9a-f]+)"
+    r"_(copilot-sandbox|copilot-egress|copilot-dind)$"
+)
+_COMPOSE_PROJECT_VOLUME_RE = re.compile(
+    r"^(" + re.escape(COPILOT_PROJECT_NAME_PREFIX) + r"[0-9a-f]+)"
+    r"_(copilot-home|copilot-dind-certs|" + re.escape(COPILOT_WORKSPACE_VOLUME_BASENAME) + r")$"
 )
 
 
@@ -302,7 +344,26 @@ def _docker_container_created_epoch(name: str) -> float | None:
     result = _run_command(["docker", "inspect", "-f", "{{.Created}}", name])
     if result.returncode != 0:
         return None
-    raw = (result.stdout or "").strip()
+    return _parse_docker_timestamp((result.stdout or "").strip())
+
+
+def _docker_network_created_epoch(name: str) -> float | None:
+    # `{{json .Created}}` rather than `{{.Created}}`: the latter renders Go's own
+    # time.Time formatting ("... +0000 UTC"), which is not parseable as RFC 3339.
+    result = _run_command(["docker", "network", "inspect", "-f", "{{json .Created}}", name])
+    if result.returncode != 0:
+        return None
+    return _parse_docker_timestamp((result.stdout or "").strip().strip('"'))
+
+
+def _docker_volume_created_epoch(name: str) -> float | None:
+    result = _run_command(["docker", "volume", "inspect", "-f", "{{json .CreatedAt}}", name])
+    if result.returncode != 0:
+        return None
+    return _parse_docker_timestamp((result.stdout or "").strip().strip('"'))
+
+
+def _parse_docker_timestamp(raw: str) -> float | None:
     if not raw:
         return None
     normalized = raw
@@ -319,32 +380,76 @@ def _docker_container_created_epoch(name: str) -> float | None:
 
 
 def _find_stale_copilot_projects(*, keep_project: str, max_age_seconds: int) -> list[str]:
-    listing = _run_command(["docker", "ps", "-a", "--format", "{{.Names}}"])
-    if listing.returncode != 0:
-        return []
+    """Projects whose every *remaining* resource is old enough to tear down.
 
-    projects: dict[str, list[str]] = {}
-    for name in (listing.stdout or "").splitlines():
-        name = name.strip()
-        match = _COMPOSE_PROJECT_CONTAINER_RE.match(name)
-        if not match:
+    Discovery deliberately does not go by containers alone. A project whose containers are
+    already gone - torn down by a `compose down` that then failed, or by a run killed
+    between the two steps - keeps its networks and volumes indefinitely, and `docker ps`
+    can never surface it again. Sweeping those requires enumerating the networks and
+    volumes directly.
+    """
+    ages: dict[str, list[float | None]] = {}
+
+    def _record(project: str, age: float | None) -> None:
+        if project != keep_project:
+            ages.setdefault(project, []).append(age)
+
+    sources = (
+        (["docker", "ps", "-a", "--format", "{{.Names}}"],
+         _COMPOSE_PROJECT_CONTAINER_RE, _docker_container_created_epoch),
+        (["docker", "network", "ls", "--format", "{{.Name}}"],
+         _COMPOSE_PROJECT_NETWORK_RE, _docker_network_created_epoch),
+        (["docker", "volume", "ls", "--format", "{{.Name}}"],
+         _COMPOSE_PROJECT_VOLUME_RE, _docker_volume_created_epoch),
+    )
+    for command, pattern, age_of in sources:
+        listing = _run_command(command)
+        if listing.returncode != 0:
             continue
-        project = match.group(1)
-        if project == keep_project:
-            continue
-        projects.setdefault(project, []).append(name)
+        for name in (listing.stdout or "").splitlines():
+            name = name.strip()
+            match = pattern.match(name)
+            if match:
+                _record(match.group(1), age_of(name))
 
     now_epoch = time.time()
     stale: list[str] = []
-    for project, container_names in projects.items():
-        # A project is only stale once every sidecar container belonging to it is old
-        # enough - a freshly started concurrent run must never be torn down mid-flight.
-        ages = [_docker_container_created_epoch(name) for name in container_names]
-        if any(age is None for age in ages):
+    for project, resource_ages in ages.items():
+        # A project is only stale once every resource belonging to it is old enough - a
+        # freshly started concurrent run must never be torn down mid-flight, and its
+        # network exists before its containers do.
+        if any(age is None for age in resource_ages):
             continue
-        if all(now_epoch - age >= max_age_seconds for age in ages):
+        if all(now_epoch - age >= max_age_seconds for age in resource_ages):
             stale.append(project)
     return stale
+
+
+def _remove_orphaned_project_resources(*, project: str) -> None:
+    """Remove any network/volume of `project` that survived `compose down`.
+
+    `compose down` is the normal path and usually suffices, but it is also the step that
+    failed for every orphan this sweep exists to collect - so the resources are removed
+    by name as well. Both commands refuse to touch anything still in use, which is the
+    safety net against racing a live run.
+    """
+    for name in (
+        f"{project}_copilot-sandbox",
+        f"{project}_copilot-egress",
+        f"{project}_copilot-dind",
+    ):
+        result = _run_command(["docker", "network", "rm", name])
+        if result.returncode == 0:
+            emit_progress(f"[copilot] removed orphaned network {name}", component="copilot")
+
+    for name in (
+        f"{project}_copilot-home",
+        f"{project}_copilot-dind-certs",
+        _workspace_volume_name(compose_project=project),
+    ):
+        result = _run_command(["docker", "volume", "rm", name])
+        if result.returncode == 0:
+            emit_progress(f"[copilot] removed orphaned volume {name}", component="copilot")
 
 
 def _teardown_stale_copilot_project(context: RuntimeExecutionContext, *, project: str) -> bool:
@@ -363,6 +468,7 @@ def _teardown_stale_copilot_project(context: RuntimeExecutionContext, *, project
         env=env,
     )
     _remove_workspace_volume(volume_name=workspace_volume)
+    _remove_orphaned_project_resources(project=project)
     if down_result.returncode != 0:
         emit_progress(
             f"[copilot] failed to tear down stale stack {project!r}: "
@@ -601,8 +707,129 @@ def _resolve_dind_image(context: RuntimeExecutionContext) -> str:
     return COPILOT_DEFAULT_DIND_IMAGE
 
 
-def _isolated_docker_host(*, dind_service: str) -> str:
-    return f"tcp://{dind_service}:{COPILOT_DIND_PORT}"
+def _resolve_dind_tls_enabled(context: RuntimeExecutionContext) -> bool:
+    """Whether dind serves its API over mutual TLS (the default and supported path).
+
+    Disabling this reverts to a plaintext, unauthenticated daemon on 2375 - anything that
+    can route to dind then has host-root-equivalent access. Only ever useful for local
+    debugging, and it forces the iptables isolation below to become mandatory.
+    """
+    for value in (
+        _resolve_runtime_option(context, "copilot_dind_tls"),
+        os.getenv("SOMA_COPILOT_DIND_TLS"),
+    ):
+        option = _coerce_bool_option(value)
+        if option is not None:
+            return option
+    return COPILOT_DEFAULT_DIND_TLS
+
+
+def _resolve_sandbox_gateway_mode(context: RuntimeExecutionContext) -> str:
+    """
+    Gateway mode for the agent's internal networks - `isolated` keeps the host off-limits.
+    """
+    for value in (
+        _resolve_runtime_option(context, "copilot_sandbox_gateway_mode"),
+        os.getenv("SOMA_COPILOT_SANDBOX_GATEWAY_MODE"),
+    ):
+        candidate = str(value or "").strip().lower()
+        if candidate in (COPILOT_SANDBOX_GATEWAY_MODE_ISOLATED, COPILOT_SANDBOX_GATEWAY_MODE_NAT):
+            return candidate
+        if candidate:
+            emit_progress(
+                f"[copilot] ignoring unsupported sandbox gateway mode {candidate!r}; "
+                f"using {COPILOT_DEFAULT_SANDBOX_GATEWAY_MODE!r}",
+                component="copilot",
+            )
+    return COPILOT_DEFAULT_SANDBOX_GATEWAY_MODE
+
+
+def _network_gateway_address(network: str) -> str:
+    result = _run_command(
+        ["docker", "network", "inspect", network, "--format", "{{json .IPAM.Config}}"]
+    )
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        return ""
+    try:
+        entries = json.loads((result.stdout or "").strip())
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(entries, list):
+        return ""
+    for entry in entries:
+        if isinstance(entry, dict) and str(entry.get("Gateway", "")).strip():
+            return str(entry["Gateway"]).strip()
+    return ""
+
+
+def _warn_if_networks_reach_host(*, compose_project: str, network_suffixes: tuple[str, ...]) -> None:
+    """Report any agent-facing network that still has a gateway, i.e. a route to the host.
+
+    Compose applies the driver option at network *creation*, so a network left over from an
+    earlier run - or one created by an engine that quietly ignored the option - can still
+    carry a gateway even though the compose file asks for `isolated`. Checking the live
+    network is the only way to know which of the two you actually got.
+    """
+    for suffix in network_suffixes:
+        network = f"{compose_project}_{suffix}"
+        gateway = _network_gateway_address(network)
+        if gateway:
+            emit_progress(
+                f"[copilot] WARNING: network {network} has gateway {gateway}; the agent can "
+                "reach host services bound to 0.0.0.0 through it. Expected no gateway "
+                "(gateway_mode_ipv4=isolated, Docker >= 28).",
+                component="copilot",
+            )
+
+
+def _resolve_dind_port(context: RuntimeExecutionContext) -> int:
+    return (
+        COPILOT_DIND_TLS_PORT
+        if _resolve_dind_tls_enabled(context)
+        else COPILOT_DIND_PLAINTEXT_PORT
+    )
+
+
+def _isolated_docker_host(*, dind_service: str, port: int = COPILOT_DIND_TLS_PORT) -> str:
+    return f"tcp://{dind_service}:{port}"
+
+
+def _resolve_swe_exec_broker_enabled(context: RuntimeExecutionContext) -> bool:
+    """
+    Whether the agent reaches the SWE sandbox through the scoped exec broker.
+    """
+    for value in (
+        _resolve_runtime_option(context, "copilot_swe_exec_broker"),
+        os.getenv("SOMA_COPILOT_SWE_EXEC_BROKER"),
+    ):
+        option = _coerce_bool_option(value)
+        if option is not None:
+            return option
+    return COPILOT_DEFAULT_SWE_EXEC_BROKER
+
+
+def _resolve_swe_exec_broker_port(context: RuntimeExecutionContext) -> int:
+    return _coerce_positive_int_option(
+        _resolve_runtime_option(context, "copilot_swe_exec_broker_port")
+        or os.getenv("SOMA_COPILOT_SWE_EXEC_BROKER_PORT"),
+        COPILOT_DEFAULT_SWE_EXEC_BROKER_PORT,
+    )
+
+
+def _resolve_swe_exec_timeout_seconds(context: RuntimeExecutionContext) -> int:
+    return _coerce_positive_int_option(
+        _resolve_runtime_option(context, "copilot_swe_exec_timeout_seconds")
+        or os.getenv("SOMA_COPILOT_SWE_EXEC_TIMEOUT_SECONDS"),
+        COPILOT_DEFAULT_SWE_EXEC_TIMEOUT_SECONDS,
+    )
+
+
+def _swe_exec_broker_script_path() -> Path:
+    return Path(__file__).resolve().parent / "copilot-cli-container" / "swe_exec_broker.py"
+
+
+def _swe_exec_client_path() -> Path:
+    return Path(__file__).resolve().parent / "copilot-cli-container" / "swe-exec"
 
 
 def _resolve_use_host_docker_socket(context: RuntimeExecutionContext) -> bool:
@@ -719,6 +946,120 @@ def _start_nested_swe_sandbox(
             "Copilot SWE sandbox did not report a container id after starting inside the isolated Docker daemon."
         )
     return container_id
+
+
+# SWE-bench's own harness builds every task image around a conda env named exactly
+# "testbed" (see e.g. its setup_env.sh / constants.py) - we saw this hold across every repo
+# family tested (django, sympy, pytest, requests, astropy). That env is not on PATH nor
+# activated by default in a one-off shell: conda activation is a bash function sourced from
+# conda.sh, which `bash -lc`/`sh -lc` never runs on their own, so every agent independently
+# rediscovers the right interpreter path by trial and error each run. This probe is
+# defensive rather than hardcoded to that one convention: it checks the common install
+# roots directly, then falls back to asking conda itself, and gives up cleanly (empty
+# string) if it finds nothing - swe-exec then just leaves PATH untouched.
+_SWE_SANDBOX_ENV_DISCOVERY_SCRIPT = r"""
+for root in /opt/miniconda3 /opt/miniconda /opt/conda /root/miniconda3 /root/miniconda /usr/local/miniconda3; do
+  if [ -x "$root/envs/testbed/bin/python" ]; then
+    echo "$root/envs/testbed/bin"
+    exit 0
+  fi
+done
+if command -v conda >/dev/null 2>&1; then
+  envdir="$(conda env list 2>/dev/null | awk '$1=="testbed"{print $NF}')"
+  if [ -n "$envdir" ] && [ -x "$envdir/bin/python" ]; then
+    echo "$envdir/bin"
+    exit 0
+  fi
+fi
+exit 1
+"""
+
+
+def _discover_swe_sandbox_env_bin_dir(*, dind_container_id: str, sandbox_container_id: str) -> str:
+    """Best-effort discovery of the task env's interpreter directory, for swe-exec's PATH.
+
+    Reaches the nested sandbox container the same way _start_nested_swe_sandbox does: a
+    host-side `docker exec` into dind, which in turn execs into the sandbox container on its
+    own isolated daemon. Never raises - a failed probe just means swe-exec falls back to
+    whatever PATH the sandbox image's own shell resolves, i.e. today's behavior.
+    """
+    result = _run_command([
+        "docker", "exec", dind_container_id,
+        "docker", "exec", sandbox_container_id,
+        "sh", "-c", _SWE_SANDBOX_ENV_DISCOVERY_SCRIPT,
+    ])
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip().splitlines()[0] if (result.stdout or "").strip() else ""
+
+
+def _start_swe_exec_broker(
+    *,
+    compose_prefix: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    broker_port: int,
+) -> str:
+    """Bring up the scoped exec broker and wait until it answers /healthz.
+
+    Started after the nested sandbox exists because the broker pins one container id and
+    refuses to exec anywhere else.
+    """
+    up_result = _run_command(
+        [*compose_prefix, "up", "-d", COPILOT_SWE_EXEC_BROKER_SERVICE],
+        cwd=cwd,
+        env=env,
+    )
+    if up_result.returncode != 0:
+        raise RuntimeError(
+            "Failed to start the Copilot SWE exec broker. "
+            f"{(up_result.stderr or up_result.stdout or '').strip()}"
+        )
+
+    ps_result = _run_command(
+        [*compose_prefix, "ps", "-q", COPILOT_SWE_EXEC_BROKER_SERVICE],
+        cwd=cwd,
+        env=env,
+    )
+    broker_container_id = (
+        (ps_result.stdout or "").strip().splitlines()[0]
+        if (ps_result.stdout or "").strip()
+        else ""
+    )
+    if not broker_container_id:
+        raise RuntimeError(
+            "Copilot SWE exec broker is not running after compose up. "
+            f"{(ps_result.stderr or ps_result.stdout or '').strip()}"
+        )
+
+    # Probed from inside the broker container: both of its networks are internal, so the
+    # host has no route to it.
+    probe_script = (
+        "import urllib.request;"
+        f"urllib.request.urlopen('http://127.0.0.1:{broker_port}/healthz', timeout=2).read()"
+    )
+    last_error = ""
+    for _ in range(COPILOT_SWE_EXEC_BROKER_READY_RETRIES):
+        probe = _run_command(
+            ["docker", "exec", broker_container_id, "python", "-c", probe_script]
+        )
+        if probe.returncode == 0:
+            return broker_container_id
+        last_error = (probe.stderr or probe.stdout or "").strip()
+        if not _docker_container_running(broker_container_id):
+            logs = _run_command(["docker", "logs", "--tail", "40", broker_container_id])
+            raise RuntimeError(
+                "Copilot SWE exec broker exited during startup. "
+                f"{(logs.stderr or logs.stdout or '').strip()}"
+            )
+        time.sleep(COPILOT_SWE_EXEC_BROKER_READY_SLEEP_SECONDS)
+
+    raise RuntimeError(f"Copilot SWE exec broker did not become ready: {last_error}")
+
+
+def _docker_container_running(container: str) -> bool:
+    result = _run_command(["docker", "inspect", "-f", "{{.State.Running}}", container])
+    return result.returncode == 0 and (result.stdout or "").strip() == "true"
 
 
 def _resolve_proxy_port(context: RuntimeExecutionContext, *, proxy_service: str) -> int:
@@ -938,6 +1279,9 @@ def _seed_workspace_volume(
     compose_project: str,
     repo_root: Path,
     owner: tuple[int, int] | None = None,
+    sandbox_image: str | None = None,
+    sandbox_repo_path: str | None = None,
+    base_commit: str | None = None,
 ) -> str:
     volume_name = _workspace_volume_name(compose_project=compose_project)
     _run_command(["docker", "volume", "rm", "-f", volume_name])
@@ -948,6 +1292,35 @@ def _seed_workspace_volume(
             f"{(create_result.stderr or create_result.stdout or '').strip()}"
         )
 
+    seeded_from_image = False
+    if sandbox_image and sandbox_repo_path:
+        seeded_from_image = _seed_workspace_volume_from_sandbox_image(
+            volume_name=volume_name,
+            sandbox_image=sandbox_image,
+            sandbox_repo_path=sandbox_repo_path,
+            base_commit=base_commit,
+            owner=owner,
+        )
+        if not seeded_from_image:
+            emit_progress(
+                "[copilot] could not seed workspace from the SWE sandbox image "
+                f"{sandbox_image!r}; falling back to a bare checkout of {repo_root} "
+                "(the task image's pre-built dependencies, compiled extensions and any "
+                "generated version files will NOT be present)",
+                component="copilot",
+            )
+
+    if not seeded_from_image:
+        _seed_workspace_volume_from_repo_root(volume_name=volume_name, repo_root=repo_root, owner=owner)
+    return volume_name
+
+
+def _seed_workspace_volume_from_repo_root(
+    *,
+    volume_name: str,
+    repo_root: Path,
+    owner: tuple[int, int] | None = None,
+) -> None:
     # The copy runs as root, which would leave the whole workspace root-owned - the agent
     # CLI runs as a non-root user (`USER copilot`), so its file tools would then fail with
     # EACCES on every write under the repo. Handing ownership to that user keeps the agent
@@ -977,7 +1350,113 @@ def _seed_workspace_volume(
             "Failed to seed Copilot workspace volume from repository checkout. "
             f"{(copy_result.stderr or copy_result.stdout or '').strip()}"
         )
-    return volume_name
+
+
+def _seed_workspace_volume_from_sandbox_image(
+    *,
+    volume_name: str,
+    sandbox_image: str,
+    sandbox_repo_path: str,
+    base_commit: str | None,
+    owner: tuple[int, int] | None = None,
+) -> bool:
+    """Seed the workspace volume from the SWE-bench task image's own checkout.
+
+    A bare external `git clone` (the previous, only, seeding path) can never reproduce what
+    the task image already has at its repo path: dependencies installed, native extensions
+    compiled, and any version file a build step generates (setuptools_scm's is gitignored by
+    convention - a fresh clone is guaranteed not to have it). Copying the image's own
+    checkout instead preserves all of that; we only need to move it from whatever commit the
+    image's dependency-install step left it at over to the instance's `base_commit`.
+
+    Intentionally does NOT run `git clean -dfx` afterward: that would delete exactly the
+    untracked/gitignored build artifacts (compiled extensions, generated version files) this
+    function exists to keep. `git checkout --force` already replaces every tracked file with
+    the `base_commit` version and removes tracked files that commit doesn't have; leaving
+    untracked build output in place is the point, not an oversight.
+
+    Returns False (leaving the volume untouched for the caller's fallback) on any failure -
+    this is a best-effort improvement, not a hard requirement for the run to proceed.
+    """
+    seed_mount = "/__soma_seed_target"
+    seed_script = (
+        f"rm -rf {seed_mount}/* {seed_mount}/.[!.]* {seed_mount}/..?* 2>/dev/null || true; "
+        f"cp -a {sandbox_repo_path}/. {seed_mount}/"
+    )
+    copy_result = _run_command(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh",
+            "-v",
+            f"{volume_name}:{seed_mount}",
+            sandbox_image,
+            "-lc",
+            seed_script,
+        ]
+    )
+    if copy_result.returncode != 0:
+        emit_progress(
+            f"[copilot] seeding workspace from sandbox image {sandbox_image!r} failed: "
+            f"{(copy_result.stderr or copy_result.stdout or '').strip()}",
+            component="copilot",
+        )
+        return False
+
+    if base_commit:
+        checkout_script = (
+            f"git config --global --add safe.directory {sandbox_repo_path} 2>/dev/null || true; "
+            f"cd {sandbox_repo_path} && git checkout --force {shlex.quote(base_commit)}"
+        )
+        checkout_result = _run_command(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "sh",
+                "-v",
+                f"{volume_name}:{sandbox_repo_path}",
+                sandbox_image,
+                "-lc",
+                checkout_script,
+            ]
+        )
+        if checkout_result.returncode != 0:
+            emit_progress(
+                f"[copilot] could not checkout base_commit {base_commit} onto the "
+                f"image-seeded workspace: "
+                f"{(checkout_result.stderr or checkout_result.stdout or '').strip()}",
+                component="copilot",
+            )
+            return False
+
+    if owner is not None:
+        chown_result = _run_command(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{volume_name}:/workspace",
+                "alpine:3.20",
+                "chown",
+                "-R",
+                f"{owner[0]}:{owner[1]}",
+                "/workspace",
+            ]
+        )
+        if chown_result.returncode != 0:
+            emit_progress(
+                f"[copilot] could not chown image-seeded workspace to {owner[0]}:{owner[1]}: "
+                f"{(chown_result.stderr or chown_result.stdout or '').strip()}",
+                component="copilot",
+            )
+            return False
+
+    return True
 
 
 def _remove_workspace_volume(*, volume_name: str) -> None:
@@ -1165,49 +1644,79 @@ def _iptables_delete_drop(*, src_ip: str, dst_ip: str, comment: str) -> None:
 def _apply_proxy_compression_isolation(
     *,
     compose_project: str,
-    proxy_service: str,
+    proxy_service: str | None = None,
+    dind_service: str | None = None,
+    exec_broker_service: str | None = None,
+    require_dind_isolation: bool = False,
+    purge_stale_rules: bool = True,
 ) -> list[tuple[str, str, str]]:
-    """Block TCP from compression-service to proxy (one-way: proxy may still call compression-service).
-
+    """
+    Fence the miner's compression service off from the rest of the sandbox network.
     Returns inserted rules as (src_ip, dst_ip, comment) tuples for later removal.
     """
     if not _ensure_bridge_netfilter():
+        if require_dind_isolation:
+            raise RuntimeError(
+                "Copilot requires iptables isolation for the dind API because mutual TLS is "
+                "disabled (SOMA_COPILOT_DIND_TLS=false), but bridge netfilter is unavailable. "
+                "Re-enable TLS or run on a host where iptables can filter bridged traffic."
+            )
         return []
 
-    _iptables_purge_stale_soma_rules()
+    if purge_stale_rules:
+        _iptables_purge_stale_soma_rules()
 
     comp_name = f"{compose_project}-{COPILOT_COMPRESSION_SERVICE_NAME}-1"
-    proxy_name = f"{compose_project}-{proxy_service}-1"
     comp_ips = _get_container_network_ips(comp_name)
-    proxy_ips = _get_container_network_ips(proxy_name)
-
     sandbox_key = next((k for k in comp_ips if "sandbox" in k), None)
     comp_ip = comp_ips.get(sandbox_key, "") if sandbox_key else next(iter(comp_ips.values()), "")
-    if sandbox_key and sandbox_key in proxy_ips:
-        proxy_ip = proxy_ips[sandbox_key]
-    else:
-        proxy_ip = next(iter(proxy_ips.values()), "")
 
-    if not comp_ip or not proxy_ip:
-        emit_progress(
-            f"[copilot] iptables isolation skipped: could not resolve container IPs "
-            f"(comp={comp_ip!r} proxy={proxy_ip!r})",
-            component="copilot",
-        )
-        return []
+    def _peer_ip(service: str) -> str:
+        peer_ips = _get_container_network_ips(f"{compose_project}-{service}-1")
+        if sandbox_key and sandbox_key in peer_ips:
+            return peer_ips[sandbox_key]
+        return next(iter(peer_ips.values()), "")
 
     comment = f"soma-iso-{compose_project[-16:]}"
-    if _iptables_insert_drop(src_ip=comp_ip, dst_ip=proxy_ip, comment=comment):
-        emit_progress(
-            f"[copilot] iptables DROP: compression ({comp_ip}) -> proxy ({proxy_ip}) tcp",
-            component="copilot",
+    rules: list[tuple[str, str, str]] = []
+
+    targets: list[tuple[str, str]] = []
+    if proxy_service:
+        targets.append(("proxy", proxy_service))
+    if dind_service:
+        targets.append(("dind", dind_service))
+    if exec_broker_service:
+        targets.append(("swe-exec-broker", exec_broker_service))
+
+    for label, service in targets:
+        peer_ip = _peer_ip(service)
+        if not comp_ip or not peer_ip:
+            message = (
+                f"[copilot] iptables isolation skipped for {label}: could not resolve "
+                f"container IPs (comp={comp_ip!r} {label}={peer_ip!r})"
+            )
+            if label == "dind" and require_dind_isolation:
+                raise RuntimeError(message.replace("[copilot] ", ""))
+            emit_progress(message, component="copilot")
+            continue
+
+        if _iptables_insert_drop(src_ip=comp_ip, dst_ip=peer_ip, comment=comment):
+            emit_progress(
+                f"[copilot] iptables DROP: compression ({comp_ip}) -> {label} ({peer_ip}) tcp",
+                component="copilot",
+            )
+            rules.append((comp_ip, peer_ip, comment))
+            continue
+
+        message = (
+            f"[copilot] iptables DROP rule insert failed for {label} "
+            "(insufficient privileges?)"
         )
-        return [(comp_ip, proxy_ip, comment)]
-    emit_progress(
-        "[copilot] iptables DROP rule insert failed (insufficient privileges?)",
-        component="copilot",
-    )
-    return []
+        if label == "dind" and require_dind_isolation:
+            raise RuntimeError(message.replace("[copilot] ", ""))
+        emit_progress(message, component="copilot")
+
+    return rules
 
 
 def _remove_proxy_compression_isolation(rules: list[tuple[str, str, str]]) -> None:
@@ -1630,16 +2139,34 @@ def _build_prompt(context: RuntimeExecutionContext) -> str:
         prompt = f"{prompt}\n\nResume context:\n{resume_prompt}"
 
     if _resolve_swe_sandbox_enabled(context) and _resolve_swe_sandbox_image(context):
-        prompt = (
+        shared_preamble = (
             f"{prompt}\n\n"
-            "The repository is checked out locally at $SWE_BENCH_SANDBOX_REPO_PATH "
-            "(your current working directory) - read and edit files there directly "
-            "with your normal file tools. "
-            "A separate SWE sandbox container with the task environment's dependencies "
-            "installed is available for running commands (tests, scripts, etc.): "
-            "use docker exec against $SWE_BENCH_SANDBOX_CONTAINER_NAME (or "
-            "$SWE_BENCH_SANDBOX_CONTAINER_ID), which sees the same files at the same path."
+            "The repository is checked out at $SWE_BENCH_SANDBOX_REPO_PATH (your working "
+            "directory) - read and edit files there with your normal file tools.\n\n"
         )
+        if _resolve_swe_exec_broker_enabled(context) and not _resolve_use_host_docker_socket(context):
+            prompt = (
+                f"{shared_preamble}"
+                "Your own shell has no interpreter or dependencies for this task. Run "
+                "anything that must execute in the task environment through `swe-exec`, "
+                "e.g. swe-exec 'python --version'. It executes in a sandbox "
+                "container that sees the same files at the same path, and forwards stdout, "
+                "stderr and the exit status. There is no Docker access - `docker` commands "
+                "will fail.\n\n"
+                "Only $SWE_BENCH_SANDBOX_REPO_PATH is shared with that container - put "
+                "scratch scripts there, not under /tmp.\n\n"
+                "`swe-exec` puts the task environment's own interpreter first on PATH, so "
+                "plain `python` is the right one. Which test runner and which packages are "
+                "installed varies by repository - check rather than assume."
+            )
+        else:
+            prompt = (
+                f"{shared_preamble}"
+                "A separate SWE sandbox container with the task environment's dependencies "
+                "is available and sees the same files at the same path. Use docker exec "
+                "against $SWE_BENCH_SANDBOX_CONTAINER_NAME (or "
+                "$SWE_BENCH_SANDBOX_CONTAINER_ID) to run commands there."
+            )
 
     if _resolve_network_isolation_enabled(context):
         prompt = (
@@ -1745,12 +2272,25 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     swe_sandbox_image = _resolve_swe_sandbox_image(context)
     dind_service = _resolve_dind_service(context)
     dind_image = _resolve_dind_image(context)
+    dind_tls_enabled = _resolve_dind_tls_enabled(context)
+    dind_port = _resolve_dind_port(context)
+    sandbox_gateway_mode = _resolve_sandbox_gateway_mode(context)
+    swe_exec_broker_enabled = _resolve_swe_exec_broker_enabled(context)
+    swe_exec_broker_port = _resolve_swe_exec_broker_port(context)
+    swe_exec_timeout_seconds = _resolve_swe_exec_timeout_seconds(context)
     use_host_docker_socket = _resolve_use_host_docker_socket(context)
     shared_proxy_mode = _resolve_shared_proxy_batch_enabled(context)
     compose_swe_sandbox_enabled = (
         swe_sandbox_enabled
         and swe_sandbox_image is not None
         and not shared_proxy_mode
+    )
+    # The broker only has a role in the dind path: the legacy host-socket bridge hands the
+    # agent the host daemon outright, and without a nested sandbox there is nothing to exec.
+    use_swe_exec_broker = (
+        swe_exec_broker_enabled
+        and compose_swe_sandbox_enabled
+        and not use_host_docker_socket
     )
     compression_enabled = True
     use_compose_compression_service = _resolve_use_compose_compression_service(context)
@@ -1822,6 +2362,9 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     env = os.environ.copy()
     env["COPILOT_COMPRESSION_SERVICE_IMAGE"] = compression_image
     env["COPILOT_PROXY_IMAGE"] = compression_image
+    # Consumed by the driver_opts of copilot-sandbox / copilot-dind. Set unconditionally so
+    # the compose default is never the thing deciding whether the host is reachable.
+    env["COPILOT_SANDBOX_GATEWAY_MODE"] = sandbox_gateway_mode
     if compression_script_path is not None:
         env["COPILOT_COMPRESSION_SCRIPT_PATH"] = str(compression_script_path)
         env["MINER_MODULE_PATH"] = COPILOT_DEFAULT_COMPRESSION_SCRIPT_CONTAINER_PATH
@@ -1862,10 +2405,24 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             f"{workspace_owner[0]}:{workspace_owner[1]} (agent user in {agent_image})",
             component="copilot",
         )
+    # Seeding from the task image itself (rather than only ever from a bare external clone)
+    # preserves whatever that image's own dependency-install step already built at the repo
+    # path - compiled extensions, editable-install metadata, generated version files - none
+    # of which a fresh `git clone` can ever have. Only applies on the dind path: the
+    # host-docker-socket fallback talks to the sandbox container directly rather than
+    # through this shared volume, and with no sandbox image at all there is nothing to seed
+    # from but the clone.
     workspace_volume = _seed_workspace_volume(
         compose_project=compose_project,
         repo_root=repo_root,
         owner=workspace_owner,
+        sandbox_image=(
+            swe_sandbox_image
+            if compose_swe_sandbox_enabled and not use_host_docker_socket
+            else None
+        ),
+        sandbox_repo_path=swe_sandbox_repo_path,
+        base_commit=base_commit,
     )
     env["COPILOT_WORKSPACE_VOLUME_NAME"] = workspace_volume
     if compose_swe_sandbox_enabled:
@@ -1878,6 +2435,44 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 default_dind_image=dind_image,
             )
             env["COPILOT_DIND_IMAGE"] = dind_image
+            env["COPILOT_DIND_SERVICE"] = dind_service
+            env["COPILOT_DIND_PORT"] = str(dind_port)
+            env["COPILOT_DIND_HOSTNAME"] = COPILOT_DIND_TLS_HOSTNAME
+            # Always set explicitly, in both directions: this reaches the daemon through the
+            # dind service's own `environment:` entry, and leaving it to whatever the host
+            # environment happens to hold would let an unrelated DOCKER_TLS_CERTDIR decide
+            # whether the daemon is authenticated.
+            env["COPILOT_DIND_TLS_CERTDIR"] = COPILOT_DIND_TLS_CERTDIR if dind_tls_enabled else ""
+            if not dind_tls_enabled:
+                # Reverts the daemon to a plaintext, unauthenticated listener. The iptables
+                # layer becomes the only remaining control, which is why
+                # _apply_proxy_compression_isolation is made mandatory below.
+                emit_progress(
+                    "[copilot] WARNING: dind mutual TLS is disabled "
+                    "(SOMA_COPILOT_DIND_TLS=false); its API is unauthenticated",
+                    component="copilot",
+                )
+    swe_exec_broker_token = ""
+    if use_swe_exec_broker:
+        broker_script = _swe_exec_broker_script_path()
+        swe_exec_client = _swe_exec_client_path()
+        for required_path, label in (
+            (broker_script, "exec broker"),
+            (swe_exec_client, "swe-exec client"),
+        ):
+            if not required_path.is_file():
+                raise RuntimeError(
+                    f"Copilot SWE {label} script is missing at {required_path}. "
+                    "Set SOMA_COPILOT_SWE_EXEC_BROKER=false to fall back to direct "
+                    "DOCKER_HOST access (which grants the agent host-root-equivalent power)."
+                )
+        swe_exec_broker_token = secrets.token_urlsafe(32)
+        env["COPILOT_SWE_EXEC_BROKER_IMAGE"] = compression_image
+        env["COPILOT_SWE_EXEC_BROKER_SCRIPT_PATH"] = str(broker_script)
+        env["COPILOT_SWE_EXEC_BROKER_TOKEN"] = swe_exec_broker_token
+        env["COPILOT_SWE_EXEC_BROKER_PORT"] = str(swe_exec_broker_port)
+        env["COPILOT_SWE_SANDBOX_REPO_PATH"] = swe_sandbox_repo_path
+        env["COPILOT_SWE_EXEC_TIMEOUT_SECONDS"] = str(swe_exec_timeout_seconds)
     if network_isolation:
         base_url_raw = str(context.llm_config.get("base_url", "")).strip()
         if not base_url_raw:
@@ -1939,10 +2534,27 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                     "Failed to start Copilot proxy sidecar. "
                     f"{(stack_up.stderr or stack_up.stdout or '').strip()}"
                 )
+            if sandbox_gateway_mode == COPILOT_SANDBOX_GATEWAY_MODE_ISOLATED:
+                _warn_if_networks_reach_host(
+                    compose_project=compose_project,
+                    network_suffixes=("copilot-sandbox", "copilot-dind"),
+                )
             if network_isolation and use_compose_compression_service:
                 isolation_rules = _apply_proxy_compression_isolation(
                     compose_project=compose_project,
                     proxy_service=proxy_service,
+                    dind_service=(
+                        dind_service
+                        if compose_swe_sandbox_enabled and not use_host_docker_socket
+                        else None
+                    ),
+                    # With TLS off, iptables is the only thing standing between the miner's
+                    # code and the privileged daemon, so a failure to insert it must abort.
+                    require_dind_isolation=(
+                        not dind_tls_enabled
+                        and compose_swe_sandbox_enabled
+                        and not use_host_docker_socket
+                    ),
                 )
 
         if compose_swe_sandbox_enabled and use_host_docker_socket:
@@ -2005,18 +2617,10 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 repo_path=swe_sandbox_repo_path,
             )
 
-            # The agent reaches the sandbox only through the isolated dind daemon's
-            # Docker API (DOCKER_HOST over the internal network) - never the host socket.
-            # DOCKER_HOST must NOT go into `env`: that dict is also the subprocess
-            # environment for the host-side `docker compose` invocations below, and
-            # docker's CLI itself honors DOCKER_HOST - setting it there would redirect
-            # compose's own host-side calls (ps/up/down) at the isolated daemon too.
             env["SWE_BENCH_SANDBOX_CONTAINER_ID"] = swe_sandbox_container_id
             env["SWE_BENCH_SANDBOX_CONTAINER_NAME"] = swe_sandbox_container_name
             env["SWE_BENCH_SANDBOX_REPO_PATH"] = swe_sandbox_repo_path
             run_container_args.extend([
-                "-e",
-                f"DOCKER_HOST={_isolated_docker_host(dind_service=dind_service)}",
                 "-e",
                 "SWE_BENCH_SANDBOX_CONTAINER_ID",
                 "-e",
@@ -2024,6 +2628,103 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 "-e",
                 "SWE_BENCH_SANDBOX_REPO_PATH",
             ])
+
+            if use_swe_exec_broker:
+                env["COPILOT_SWE_EXEC_SANDBOX_CONTAINER"] = swe_sandbox_container_id
+                env_bin_dir = _discover_swe_sandbox_env_bin_dir(
+                    dind_container_id=dind_container_id,
+                    sandbox_container_id=swe_sandbox_container_id,
+                )
+                if env_bin_dir:
+                    emit_progress(
+                        f"[{context.instance.instance_id}] swe-exec will default PATH to "
+                        f"{env_bin_dir} (discovered task env interpreter)",
+                        component="copilot",
+                    )
+                    env["COPILOT_SWE_EXEC_SANDBOX_ENV_BIN_DIR"] = env_bin_dir
+                else:
+                    emit_progress(
+                        f"[{context.instance.instance_id}] could not discover a task-specific "
+                        "conda env for swe-exec; PATH will default to whatever the sandbox "
+                        "image's own shell resolves",
+                        component="copilot",
+                    )
+                _start_swe_exec_broker(
+                    compose_prefix=compose_prefix,
+                    cwd=repo_root,
+                    env=env,
+                    broker_port=swe_exec_broker_port,
+                )
+                if network_isolation and use_compose_compression_service:
+                    isolation_rules.extend(
+                        _apply_proxy_compression_isolation(
+                            compose_project=compose_project,
+                            exec_broker_service=COPILOT_SWE_EXEC_BROKER_SERVICE,
+                            purge_stale_rules=False,
+                        )
+                    )
+                broker_url = (
+                    f"http://{COPILOT_SWE_EXEC_BROKER_SERVICE}:{swe_exec_broker_port}"
+                )
+                env["SWE_EXEC_BROKER_URL"] = broker_url
+                env["SWE_EXEC_BROKER_TOKEN"] = swe_exec_broker_token
+                env["SWE_EXEC_TIMEOUT_SECONDS"] = str(swe_exec_timeout_seconds)
+                run_container_args.extend([
+                    "-v",
+                    f"{_swe_exec_client_path()}:{COPILOT_SWE_EXEC_CLIENT_CONTAINER_PATH}:ro",
+                    "-e",
+                    "SWE_EXEC_BROKER_URL",
+                    "-e",
+                    "SWE_EXEC_BROKER_TOKEN",
+                    "-e",
+                    "SWE_EXEC_TIMEOUT_SECONDS",
+                ])
+                emit_progress(
+                    f"[{context.instance.instance_id}] SWE sandbox reachable via exec broker "
+                    f"at {broker_url} (agent holds no Docker API access)",
+                    component="copilot",
+                )
+            else:
+                sandbox_network = f"{compose_project}_copilot-sandbox"
+                connect_result = _run_command([
+                    "docker", "network", "connect",
+                    "--alias", dind_service,
+                    "--alias", COPILOT_DIND_TLS_HOSTNAME,
+                    sandbox_network, dind_container_id,
+                ])
+                if connect_result.returncode != 0:
+                    connect_details = (
+                        connect_result.stderr or connect_result.stdout or ""
+                    ).strip()
+                    # Compose only creates copilot-sandbox once a service that uses it comes
+                    # up, so with a dind-only stack the network may not exist yet. Failing
+                    # loudly beats handing the agent a DOCKER_HOST it cannot route to.
+                    if "already exists" not in connect_details:
+                        raise RuntimeError(
+                            "Could not attach the isolated Docker daemon to the agent "
+                            "network, which the SOMA_COPILOT_SWE_EXEC_BROKER=false fallback "
+                            f"requires: {connect_details}"
+                        )
+                emit_progress(
+                    "[copilot] WARNING: exec broker disabled",
+                    component="copilot",
+                )
+                dind_host = _isolated_docker_host(
+                    dind_service=(
+                        COPILOT_DIND_TLS_HOSTNAME if dind_tls_enabled else dind_service
+                    ),
+                    port=dind_port,
+                )
+                run_container_args.extend(["-e", f"DOCKER_HOST={dind_host}"])
+                if dind_tls_enabled:
+                    run_container_args.extend([
+                        "-v",
+                        f"{compose_project}_copilot-dind-certs:{COPILOT_DIND_CLIENT_CERT_DIR}:ro",
+                        "-e",
+                        "DOCKER_TLS_VERIFY=1",
+                        "-e",
+                        f"DOCKER_CERT_PATH={COPILOT_DIND_CLIENT_CERT_DIR}",
+                    ])
 
         if compose_swe_sandbox_enabled:
             command = [
@@ -2101,6 +2802,8 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             sidecar_service_names = {proxy_service, COPILOT_DEFAULT_PROXY_SERVICE, "compression-service"}
             if compose_swe_sandbox_enabled:
                 sidecar_service_names.add(swe_sandbox_service if use_host_docker_socket else dind_service)
+            if use_swe_exec_broker:
+                sidecar_service_names.add(COPILOT_SWE_EXEC_BROKER_SERVICE)
             sidecar_services = [service_name for service_name in sidecar_service_names]
             sidecar_log_paths = _collect_compose_service_logs(
                 compose_prefix=compose_prefix,
@@ -2124,7 +2827,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             )
             stack_down_stdout = stack_down.stdout or ""
             stack_down_stderr = stack_down.stderr or ""
-            for _net_suffix in ("copilot-sandbox", "copilot-egress"):
+            for _net_suffix in ("copilot-sandbox", "copilot-egress", "copilot-dind"):
                 _run_command(["docker", "network", "rm", f"{compose_project}_{_net_suffix}"])
         if not keep_stack:
             _remove_workspace_volume(volume_name=workspace_volume)
@@ -2168,7 +2871,14 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "swe_sandbox_repo_path": swe_sandbox_repo_path,
         "dind_service": dind_service,
         "dind_image": dind_image,
-        "docker_bridge_mode": "host-socket" if use_host_docker_socket else "dind",
+        "dind_tls": dind_tls_enabled,
+        "dind_port": dind_port,
+        "swe_exec_broker": use_swe_exec_broker,
+        "docker_bridge_mode": (
+            "host-socket"
+            if use_host_docker_socket
+            else ("dind-broker" if use_swe_exec_broker else "dind-direct")
+        ),
         "stack_up_stdout": stack_up_stdout,
         "stack_up_stderr": stack_up_stderr,
         "stack_down_stdout": stack_down_stdout,

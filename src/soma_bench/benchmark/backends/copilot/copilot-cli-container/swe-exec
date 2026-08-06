@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Run a command inside the SWE sandbox container.
+#
+# The agent has no Docker API access by design (see swe_exec_broker.py). This client talks
+# to the broker, which is the only holder of the isolated daemon's credentials and can only
+# ever exec into the one pre-created sandbox container.
+#
+# Usage:
+#   swe-exec 'python -m pytest tests/test_x.py -k "some name"'
+#   swe-exec python -m pytest tests/test_x.py
+#
+# The arguments are joined into a single shell command executed by `sh -lc` inside the
+# sandbox, whose working directory is $SWE_BENCH_SANDBOX_REPO_PATH. Prefer the quoted
+# single-string form when the command contains quotes, pipes, or redirections.
+
+set -uo pipefail
+
+if [ -z "${SWE_EXEC_BROKER_URL:-}" ] || [ -z "${SWE_EXEC_BROKER_TOKEN:-}" ]; then
+  echo "swe-exec: the sandbox exec broker is not configured in this environment" >&2
+  exit 127
+fi
+
+if [ "$#" -eq 0 ]; then
+  echo "usage: swe-exec <command>    # runs in the SWE sandbox at \$SWE_BENCH_SANDBOX_REPO_PATH" >&2
+  exit 2
+fi
+
+headers_file="$(mktemp)"
+body_file="$(mktemp)"
+trap 'rm -f "$headers_file" "$body_file"' EXIT
+
+curl_args=(
+  -sS
+  -X POST
+  --data-binary @-
+  -H "Authorization: Bearer ${SWE_EXEC_BROKER_TOKEN}"
+  -H "Content-Type: text/plain"
+  -D "$headers_file"
+  -o "$body_file"
+)
+if [ -n "${SWE_EXEC_TIMEOUT_SECONDS:-}" ]; then
+  curl_args+=(-H "X-Timeout-Seconds: ${SWE_EXEC_TIMEOUT_SECONDS}")
+fi
+
+if ! printf '%s' "$*" | curl "${curl_args[@]}" "${SWE_EXEC_BROKER_URL}/exec"; then
+  echo "swe-exec: could not reach the sandbox exec broker at ${SWE_EXEC_BROKER_URL}" >&2
+  exit 125
+fi
+
+cat "$body_file"
+
+http_status="$(sed -n '1s/.*[[:space:]]\([0-9][0-9][0-9]\)[[:space:]].*/\1/p;1s/.*[[:space:]]\([0-9][0-9][0-9]\)$/\1/p' "$headers_file" | tail -1)"
+if [ "${http_status:-200}" = "401" ]; then
+  echo "swe-exec: broker rejected the request (bad token)" >&2
+  exit 126
+fi
+
+if grep -qi '^x-output-truncated:[[:space:]]*true' "$headers_file"; then
+  echo "swe-exec: output was too large and the middle was omitted (head and tail kept)" >&2
+fi
+
+# 125 means the broker could not determine the real status - never treat it as success.
+exit_code="$(grep -i '^x-exit-code:' "$headers_file" | tr -d '\r' | sed 's/.*:[[:space:]]*//' | tail -1)"
+case "$exit_code" in
+  ''|*[!0-9]*) exit 1 ;;
+  *) exit "$exit_code" ;;
+esac

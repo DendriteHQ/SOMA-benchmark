@@ -23,6 +23,8 @@ from ... import dind_utils
 from ...swerebench_eval import capture_repo_patch
 from ...progress import emit_progress
 from ...registry_auth import docker_env_for_image, uses_token_auth
+from ...soma_task_eval import maybe_run_soma_task_evaluation
+from ...soma_tasks import ROLE_ENV, is_soma_task, task_image_workdir
 from ...swebench_images import derive_prebaked_dind_image, resolve_prebaked_dind_repo
 
 COPILOT_WORKSPACE_ERROR = (
@@ -665,6 +667,10 @@ def _resolve_swe_sandbox_repo_path(context: RuntimeExecutionContext) -> str:
     for value in (
         _resolve_runtime_option(context, "copilot_swe_sandbox_repo_path"),
         os.getenv("SOMA_COPILOT_SWE_SANDBOX_REPO_PATH"),
+        # SOMA task images declare where their checkout lives (/repo), which differs from
+        # SWE-bench's /testbed convention - taking it from the image keeps the agent's
+        # working directory, the sandbox mount and the prompt pointing at one path.
+        task_image_workdir(context.instance.hidden_eval, ROLE_ENV),
         COPILOT_DEFAULT_SWE_SANDBOX_REPO_PATH,
     ):
         if isinstance(value, str) and value.strip():
@@ -904,6 +910,12 @@ def _resolve_effective_dind_image(
 
     repo = _resolve_prebaked_dind_repo(context)
     if not repo:
+        return default_dind_image
+
+    if is_soma_task(context.instance.hidden_eval):
+        # The prebake repo and its `<repo>:<instance-id>` tag scheme are built from SWE-bench
+        # images; a SOMA task's env image is never published under it, so probing would only
+        # cost a guaranteed-miss pull and log a misleading warning on every instance.
         return default_dind_image
 
     candidate = derive_prebaked_dind_image(context.instance.instance_id, repo=repo)
@@ -2425,6 +2437,11 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         base_commit=base_commit,
     )
     env["COPILOT_WORKSPACE_VOLUME_NAME"] = workspace_volume
+    # Set unconditionally: the compose file interpolates this into the agent container's own
+    # working_dir and workspace mount, not just the exec broker's config. Leaving it unset for
+    # non-broker runs would strand the agent at the default path while the prompt, the sandbox
+    # mount and the broker all pointed at the image's real repo path.
+    env["COPILOT_SWE_SANDBOX_REPO_PATH"] = swe_sandbox_repo_path
     if compose_swe_sandbox_enabled:
         if use_host_docker_socket:
             env["COPILOT_SWE_SANDBOX_IMAGE"] = swe_sandbox_image
@@ -2471,7 +2488,6 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         env["COPILOT_SWE_EXEC_BROKER_SCRIPT_PATH"] = str(broker_script)
         env["COPILOT_SWE_EXEC_BROKER_TOKEN"] = swe_exec_broker_token
         env["COPILOT_SWE_EXEC_BROKER_PORT"] = str(swe_exec_broker_port)
-        env["COPILOT_SWE_SANDBOX_REPO_PATH"] = swe_sandbox_repo_path
         env["COPILOT_SWE_EXEC_TIMEOUT_SECONDS"] = str(swe_exec_timeout_seconds)
     if network_isolation:
         base_url_raw = str(context.llm_config.get("base_url", "")).strip()
@@ -2515,6 +2531,10 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "has_changes": False,
         "line_count": 0,
         "size_bytes": 0,
+    }
+    patch_evaluation: dict[str, Any] = {
+        "status": "not-evaluated",
+        "reason": "the agent run did not reach patch evaluation",
     }
 
     isolation_rules: list[tuple[str, str, str]] = []
@@ -2797,6 +2817,23 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 f"[{context.instance.instance_id}] patch capture status: {patch_capture.get('status')} changes={patch_capture.get('has_changes')}",
                 component="copilot",
             )
+            # Graded in a throwaway container off the task's own test image, on the host
+            # engine rather than the run's dind - the agent's stack is torn down right after
+            # this block, and the grading container must not share its network anyway.
+            patch_evaluation = maybe_run_soma_task_evaluation(
+                instance_id=context.instance.instance_id,
+                hidden_eval=context.instance.hidden_eval,
+                fail_to_pass=context.instance.fail_to_pass,
+                pass_to_pass=context.instance.pass_to_pass,
+                patch_capture=patch_capture,
+                output_dir=tmp_run_dir / "patch-eval",
+                runtime_options=_resolve_runtime_options(context),
+            )
+            emit_progress(
+                f"[{context.instance.instance_id}] patch evaluation status: "
+                f"{patch_evaluation.get('status')} resolved={patch_evaluation.get('resolved')}",
+                component="copilot",
+            )
     finally:
         if stack_up_attempted:
             sidecar_service_names = {proxy_service, COPILOT_DEFAULT_PROXY_SERVICE, "compression-service"}
@@ -2900,6 +2937,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "agent_timeout_seconds": agent_timeout_seconds,
         "agent_timed_out": agent_timed_out,
         "patch_capture": patch_capture,
+        "patch_evaluation": patch_evaluation,
         "token_usage": proxy_token_usage,
         **sidecar_log_paths,
         **message_request_log_paths,

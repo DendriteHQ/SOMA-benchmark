@@ -26,6 +26,10 @@ OPENCLAW_PATCH_EXCLUDE_PATHS = (
     "USER.md",
     "OPENCLAW_BENCHMARK_ENV.sh",
     "issue.md",
+    # SOMA task images ship a build-time leftover at the repo root (the stashed .dockerignore).
+    # It is untracked and identical in the env and test images, so letting it into the diff
+    # would put a file the test image already has into every single agent patch.
+    "*.soma-stashed",
 )
 
 

@@ -391,6 +391,10 @@ def normalize_runtime_setup_entry(row: dict[str, Any], *, benchmark_name: str) -
         "image_name",
         "license_name",
         "ground_truth",
+        # SOMA task rows ship their own env/test images and the command their graded test
+        # run uses; both are needed downstream (image resolution and grading respectively).
+        "images",
+        "test_command",
     ):
         value = row.get(key)
         if value is None:

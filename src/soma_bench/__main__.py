@@ -43,6 +43,12 @@ def main() -> int:
         add_help=False,
     )
 
+    benchmark_load_tasks = subparsers.add_parser(
+        "benchmark-load-tasks",
+        help="Cache a SOMA task JSONL so --benchmark can select its instances offline.",
+        add_help=False,
+    )
+
     args, extras = parser.parse_known_args()
     if args.command == "info":
         if extras:
@@ -72,6 +78,10 @@ def main() -> int:
         from soma_bench.benchmark.swebench_dind_prebake import main as benchmark_prebake_dind_images_main
 
         return benchmark_prebake_dind_images_main(extras)
+    if args.command == "benchmark-load-tasks":
+        from soma_bench.benchmark.soma_tasks import main as benchmark_load_tasks_main
+
+        return benchmark_load_tasks_main(extras)
     raise ValueError(f"Unsupported command: {args.command}")
 
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping
 
+from .soma_tasks import ROLE_ENV, task_image
+
 DEFAULT_SWEREBENCH_NAMESPACE = "swebench"
 DEFAULT_INSTANCE_IMAGE_TAG = "latest"
 
@@ -56,6 +58,12 @@ def resolve_benchmark_runtime_image(
     explicit_image = _first_non_empty_image(hidden_eval)
     if explicit_image:
         return explicit_image
+
+    # SOMA task rows name their agent-workspace image directly, so no name has to be derived
+    # from the instance id and no SWE-bench namespace convention applies to them.
+    soma_env_image = task_image(hidden_eval, ROLE_ENV)
+    if soma_env_image:
+        return soma_env_image
 
     benchmark_name = str(hidden_eval.get("benchmark", "")).strip()
     if not benchmark_name or not is_swebench_benchmark(benchmark_name):

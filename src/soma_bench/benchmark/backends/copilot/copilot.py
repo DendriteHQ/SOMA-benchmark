@@ -25,7 +25,12 @@ from ...progress import emit_progress
 from ...registry_auth import docker_env_for_image, uses_token_auth
 from ...soma_task_eval import maybe_run_soma_task_evaluation
 from ...soma_tasks import ROLE_ENV, is_soma_task, task_image_workdir
-from ...swebench_images import derive_prebaked_dind_image, resolve_prebaked_dind_repo
+from ...swebench_images import (
+    default_soma_task_dind_repo,
+    derive_prebaked_dind_image,
+    resolve_prebaked_dind_repo,
+    resolve_soma_task_dind_repo,
+)
 
 COPILOT_WORKSPACE_ERROR = (
     "Copilot backend currently supports only docker workspace execution. "
@@ -881,6 +886,10 @@ def _resolve_prebaked_dind_repo(context: RuntimeExecutionContext) -> str | None:
     return resolve_prebaked_dind_repo(_resolve_runtime_options(context))
 
 
+def _resolve_soma_task_dind_repo(context: RuntimeExecutionContext) -> str | None:
+    return resolve_soma_task_dind_repo(_resolve_runtime_options(context))
+
+
 def _try_pull_docker_image(image_ref: str) -> bool:
     # Auth comes from DOCKERHUB_USERNAME/DOCKERHUB_TOKEN via a process-private DOCKER_CONFIG
     # (see registry_auth.py), so a private prebaked repo pulls on any host without a prior
@@ -897,6 +906,28 @@ def _try_pull_docker_image(image_ref: str) -> bool:
     return False
 
 
+def _probe_prebaked_dind_image(
+    *, repo: str, instance_id: str, default_dind_image: str
+) -> str:
+    """Use the baked image at ``repo:<instance-id>`` if it is there, else fall back.
+
+    Shared by both the public-SWE-bench and the SOMA-task path below -- same tag
+    scheme (derive_prebaked_dind_image), just a different repo, because the two
+    corpora's env images live under different naming conventions (see
+    swebench_images.py's own module-level notes on each).
+    """
+    candidate = derive_prebaked_dind_image(instance_id, repo=repo)
+    if dind_utils.docker_image_exists(candidate) or _try_pull_docker_image(candidate):
+        return candidate
+
+    emit_progress(
+        f"[copilot] prebaked dind image {candidate!r} unavailable; "
+        "falling back to on-demand save/load into a plain dind daemon.",
+        component="copilot",
+    )
+    return default_dind_image
+
+
 def _resolve_effective_dind_image(
     context: RuntimeExecutionContext,
     *,
@@ -908,26 +939,24 @@ def _resolve_effective_dind_image(
         # Explicit override (runtime option or SOMA_COPILOT_DIND_IMAGE) always wins.
         return dind_image
 
+    if is_soma_task(context.instance.hidden_eval):
+        repo = _resolve_soma_task_dind_repo(context) or default_soma_task_dind_repo(swe_sandbox_image)
+        if not repo:
+            return default_dind_image
+        return _probe_prebaked_dind_image(
+            repo=repo,
+            instance_id=context.instance.instance_id,
+            default_dind_image=default_dind_image,
+        )
+
     repo = _resolve_prebaked_dind_repo(context)
     if not repo:
         return default_dind_image
-
-    if is_soma_task(context.instance.hidden_eval):
-        # The prebake repo and its `<repo>:<instance-id>` tag scheme are built from SWE-bench
-        # images; a SOMA task's env image is never published under it, so probing would only
-        # cost a guaranteed-miss pull and log a misleading warning on every instance.
-        return default_dind_image
-
-    candidate = derive_prebaked_dind_image(context.instance.instance_id, repo=repo)
-    if dind_utils.docker_image_exists(candidate) or _try_pull_docker_image(candidate):
-        return candidate
-
-    emit_progress(
-        f"[copilot] prebaked dind image {candidate!r} unavailable; "
-        "falling back to on-demand save/load into a plain dind daemon.",
-        component="copilot",
+    return _probe_prebaked_dind_image(
+        repo=repo,
+        instance_id=context.instance.instance_id,
+        default_dind_image=default_dind_image,
     )
-    return default_dind_image
 
 
 def _start_nested_swe_sandbox(

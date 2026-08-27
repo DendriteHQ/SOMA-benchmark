@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -46,6 +47,33 @@ from .swebench_images import (
 DEFAULT_DATASET = "SWE-bench/SWE-bench_Verified"
 DEFAULT_SPLIT = "test"
 DEFAULT_BASE_DIND_IMAGE = "docker:27-dind"
+
+OVERLAY_XATTR_PATTERN = "trusted.overlay.*"
+
+PREBAKE_ENTRYPOINT = """#!/bin/sh
+set -e
+
+PREBAKED_TAR=/prebaked.tar
+MARKER=/var/lib/docker/.soma-prebaked
+TAR=/usr/bin/tar
+
+if [ -f "$PREBAKED_TAR" ] && [ ! -e "$MARKER" ]; then
+    if ! "$TAR" --version 2>/dev/null | head -1 | grep -qi 'gnu tar'; then
+        echo "soma-prebake: $TAR is not GNU tar; refusing to unpack without xattr support" >&2
+        exit 1
+    fi
+    echo "soma-prebake: unpacking baked docker storage into /var/lib/docker" >&2
+    "$TAR" --xattrs --xattrs-include='OVERLAY_XATTR_PATTERN_PLACEHOLDER' --numeric-owner \\
+        -xf "$PREBAKED_TAR" -C /var/lib/docker
+    touch "$MARKER"
+    echo "soma-prebake: unpack done" >&2
+fi
+
+exec dockerd-entrypoint.sh "$@"
+"""
+PREBAKE_ENTRYPOINT = PREBAKE_ENTRYPOINT.replace(
+    "OVERLAY_XATTR_PATTERN_PLACEHOLDER", OVERLAY_XATTR_PATTERN
+)
 DEFAULT_CONCURRENCY = 2
 CONTAINER_NAME_PREFIX = "soma-dind-prebake-"
 
@@ -173,6 +201,19 @@ class BuildResult:
         self.detail = detail
 
 
+def _count_opaque_xattrs(tar_path: Path) -> int:
+    """How many directories in the archive carry `trusted.overlay.opaque`.
+
+    Read back off the finished archive rather than counted while walking the tree, so
+    what is reported is what a consumer will actually unpack.
+    """
+    import tarfile
+
+    key = "SCHILY.xattr.trusted.overlay.opaque"
+    with tarfile.open(tar_path) as archive:
+        return sum(1 for member in archive if key in member.pax_headers)
+
+
 def build_one(
     instance_id: str,
     *,
@@ -184,12 +225,21 @@ def build_one(
 ) -> BuildResult:
     container_name = f"{CONTAINER_NAME_PREFIX}{_sanitize_for_container_name(instance_id)}-{uuid.uuid4().hex[:8]}"
     verify_container_name = f"{container_name}-verify"
+    # An explicit bind mount for the dind's storage, rather than the anonymous volume the
+    # base image's `VOLUME /var/lib/docker` would otherwise create. Two reasons: the tar
+    # step below needs to read this tree from the host with GNU tar (docker cp cannot -
+    # it drops xattrs, see OVERLAY_XATTR_PATTERN), and knowing the path outright beats
+    # inspecting Docker's own volume bookkeeping for it. It also removes the multi-GB
+    # `docker cp` this function used to do: the inner dockerd now writes the only copy
+    # that is ever made.
+    storage_dir = Path(tempfile.mkdtemp(prefix="soma-dind-prebake-storage-"))
     _log(f"[{instance_id}] starting dind ({base_dind_image}) as {container_name}")
     try:
         run_result = dind_utils.run_command([
             "docker", "run", "-d", "--privileged",
             "--name", container_name,
             "-e", "DOCKER_TLS_CERTDIR=",
+            "-v", f"{storage_dir}:/var/lib/docker",
             base_dind_image,
         ])
         if run_result.returncode != 0:
@@ -217,48 +267,78 @@ def build_one(
                 detail=f"dind did not shut down cleanly (exit code {exit_code}); not baking",
             )
 
-        # NOTE: `docker:dind` declares /var/lib/docker as a VOLUME, and `docker commit`
-        # never captures volume data - only the container's own writable layer. A plain
-        # commit here silently produces an image with an EMPTY /var/lib/docker (confirmed
-        # by hand: commit -> fresh container -> `docker images` inside comes back empty).
-        # The correct approach: `docker cp` the volume's actual contents out to the host,
-        # then `docker build` a new image with a Dockerfile that COPies that data back into
-        # /var/lib/docker. Because that path is still a declared VOLUME (inherited from the
-        # base image), Docker auto-creates a fresh anonymous volume for it on the next
-        # container start - and since the image itself has content there, Docker seeds the
-        # new anonymous volume from that image content (documented Docker volume behavior).
-        # Confirmed working end-to-end by hand before wiring this into the script.
+        # `docker commit` is not an option here: `docker:dind` declares /var/lib/docker as
+        # a VOLUME and a commit only captures the container's own writable layer, so it
+        # produces an image with an empty storage tree (confirmed by hand: commit ->
+        # fresh container -> `docker images` inside comes back empty). Nor can the tree be
+        # COPYed into an image layer - see PREBAKE_ENTRYPOINT for why that is not a
+        # tunable failure but a property of overlayfs. What does work: carry the tree as
+        # a single tar *file* in the image (inert regular file, no special files in the
+        # layer at all) and unpack it into the mounted volume on first start.
         with tempfile.TemporaryDirectory(prefix="soma-dind-prebake-") as build_context_dir:
-            volume_copy_dir = Path(build_context_dir) / "varlibdocker"
-            volume_copy_dir.mkdir()
-            _log(f"[{instance_id}] extracting dind volume data (docker cp, several GB, can take a minute)")
-            cp_result = dind_utils.run_command([
-                "docker", "cp", f"{container_name}:/var/lib/docker/.", str(volume_copy_dir),
+            context = Path(build_context_dir)
+            tar_path = context / "prebaked.tar"
+            _log(f"[{instance_id}] archiving dind storage (several GB, can take a minute)")
+            # GNU tar on the host, not `docker cp`/`docker export`: those go through
+            # Docker's own archive code, which does not carry trusted.* xattrs, and losing
+            # them is silent content corruption rather than an error (see
+            # OVERLAY_XATTR_PATTERN). --numeric-owner because the ids in this tree are the
+            # inner daemon's, and must not be remapped through the build host's passwd.
+            tar_result = dind_utils.run_command([
+                "tar",
+                "--xattrs",
+                f"--xattrs-include={OVERLAY_XATTR_PATTERN}",
+                "--numeric-owner",
+                "-cf", str(tar_path),
+                "-C", str(storage_dir),
+                ".",
             ])
-            if cp_result.returncode != 0:
-                return BuildResult(instance_id, status="failed", detail=f"docker cp failed: {cp_result.stderr}")
+            if tar_result.returncode != 0:
+                return BuildResult(instance_id, status="failed", detail=f"tar failed: {tar_result.stderr}")
 
-            dockerfile_path = Path(build_context_dir) / "Dockerfile"
-            dockerfile_path.write_text(
-                f"FROM {base_dind_image}\nCOPY varlibdocker /var/lib/docker\n",
+            # Counted and logged because losing these is the one failure mode of this
+            # whole approach that produces a working-looking image with wrong content -
+            # a run that reports 0 here for a task whose build deletes directories is the
+            # signal that the xattr path broke, and there is nothing else to notice it by.
+            opaque = _count_opaque_xattrs(tar_path)
+            _log(f"[{instance_id}] archived {tar_path.stat().st_size} bytes, {opaque} opaque-dir marker(s)")
+
+            # Free the storage tree before the build rather than in the `finally` below:
+            # the tar is a full second copy, and holding both across a build that also
+            # streams the context into BuildKit is the peak disk figure for a whole run.
+            shutil.rmtree(storage_dir, ignore_errors=True)
+
+            entrypoint_path = context / "prebake-entrypoint.sh"
+            entrypoint_path.write_text(PREBAKE_ENTRYPOINT, encoding="utf-8")
+            # COPY carries the mode straight from the build context, and a 0644 entrypoint
+            # fails at container start with a bare "executable file not found in $PATH".
+            entrypoint_path.chmod(0o755)
+            # `apk add tar` assumes an Alpine-based dind (which every `docker:*-dind` tag
+            # is). A non-Alpine --base-dind-image fails loudly right here, which is the
+            # intent: the alternative is busybox tar silently dropping xattrs at runtime.
+            (context / "Dockerfile").write_text(
+                f"FROM {base_dind_image}\n"
+                "RUN apk add --no-cache tar\n"
+                "COPY prebaked.tar /prebaked.tar\n"
+                "COPY prebake-entrypoint.sh /usr/local/bin/soma-prebake-entrypoint.sh\n"
+                'ENTRYPOINT ["soma-prebake-entrypoint.sh"]\n',
                 encoding="utf-8",
             )
             _log(f"[{instance_id}] building baked image {target_image}")
-            # DOCKER_BUILDKIT=0 forces the classic builder deliberately. BuildKit keeps the
-            # COPY layer *and* the whole build context in its own content store, which the
-            # `docker rmi target_image` below does NOT reclaim - only `docker builder prune`
-            # does, and nothing here calls it. Measured leak: 358GB of reclaimable cache
-            # after ~22 builds while only 4 baked images existed locally (~48GB/h, would have
-            # filled the disk ~13h into a 500-instance run). The classic builder writes plain
-            # image layers instead, so the existing rmi frees everything. Verified by A/B on
-            # docker 29.1.4: classic build leaves the cache byte-identical, BuildKit grows it
-            # and keeps the growth after rmi.
+            # BuildKit keeps the exported layer *and* the build context in its own content
+            # store, and `docker rmi` does not reclaim either - only `docker builder prune`
+            # does. Measured leak before that call existed: 358GB reclaimable after ~22
+            # builds with only 4 baked images on disk (~48GB/h, enough to fill the disk
+            # part-way into a 500-instance run).
             build_result = dind_utils.run_command(
-                ["docker", "build", "-t", target_image, build_context_dir],
-                env={**os.environ, "DOCKER_BUILDKIT": "0"},
+                ["docker", "build", "-t", target_image, str(context)],
             )
             if build_result.returncode != 0:
                 return BuildResult(instance_id, status="failed", detail=f"docker build failed: {build_result.stderr}")
+            prune_result = dind_utils.run_command(["docker", "builder", "prune", "-f"])
+            if prune_result.returncode != 0:
+                # Non-fatal: the bake itself succeeded, this is just cache hygiene.
+                _log(f"[{instance_id}] warning: docker builder prune failed: {prune_result.stderr}")
 
         # Verification pass: fresh container from the baked image, no load step.
         _log(f"[{instance_id}] verifying baked image from a fresh container")
@@ -268,9 +348,26 @@ def build_one(
             target_image,
         ])
         if verify_run.returncode != 0:
+            # `docker run -d` can create the container and still fail to start it (a bad
+            # entrypoint is the usual way), which leaves it behind in Created state -
+            # observed in practice, so the removal cannot live only in the try/finally
+            # below that this early return skips.
+            dind_utils.run_command(["docker", "rm", "-f", "-v", verify_container_name])
             return BuildResult(instance_id, status="failed", detail=f"verify container failed to start: {verify_run.stderr}")
         try:
             dind_utils.wait_for_dind_ready(dind_container_id=verify_container_name)
+            # The unpack marker, checked before the image itself: if the entrypoint
+            # skipped or half-did the unpack, `docker image inspect` failing below would
+            # read as "the bake lost the image" when the real fault is one step earlier.
+            marker_result = dind_utils.run_command([
+                "docker", "exec", verify_container_name,
+                "test", "-e", "/var/lib/docker/.soma-prebaked",
+            ])
+            if marker_result.returncode != 0:
+                return BuildResult(
+                    instance_id, status="failed",
+                    detail="verification failed: baked image did not unpack its storage tree",
+                )
             inspect_result = dind_utils.run_command(
                 ["docker", "exec", verify_container_name, "docker", "image", "inspect", source_image]
             )
@@ -305,6 +402,9 @@ def build_one(
         # image) is orphaned and never reclaimed - confirmed leaking ~1GB/instance in
         # practice before this fix (docker volume prune recovered 10.8GB from ~14 builds).
         dind_utils.run_command(["docker", "rm", "-f", "-v", container_name])
+        # The bind-mounted storage tree is ours, not Docker's, so `docker rm -v` does not
+        # touch it - several GB per instance if left behind.
+        shutil.rmtree(storage_dir, ignore_errors=True)
         if not keep_source_image:
             dind_utils.run_command(["docker", "rmi", source_image])
 
@@ -318,12 +418,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--select", default=None, help="Optional file with one instance_id per line.")
+    parser.add_argument(
+        "--instance-id",
+        default=None,
+        help=(
+            "Bake exactly this one instance instead of a dataset split -- pairs with "
+            "--source-image, and skips the dataset load, --select/--limit filtering and "
+            "the orphaned-container sweep entirely (that sweep removes every "
+            f"'{CONTAINER_NAME_PREFIX}*' container on the host, which is only safe for a "
+            "lone offline batch run, not for several single-instance calls in flight at "
+            "once -- see quality_worker.prebake, the caller this mode exists for)."
+        ),
+    )
+    parser.add_argument(
+        "--source-image",
+        default=None,
+        help=(
+            "Explicit source image for --instance-id, bypassing --namespace/"
+            "derive_swebench_instance_image entirely. Required with --instance-id: a "
+            "SOMA task's env image is never named by that convention (see "
+            "swebench_images.resolve_benchmark_runtime_image)."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="Rebuild even if the target tag already exists.")
     parser.add_argument("--no-push", action="store_true", help="Build/commit/verify locally, skip login and push.")
     parser.add_argument("--keep-source-images", action="store_true")
     parser.add_argument("--base-dind-image", default=DEFAULT_BASE_DIND_IMAGE)
     args = parser.parse_args(argv)
+
+    if bool(args.instance_id) != bool(args.source_image):
+        parser.error("--instance-id and --source-image must be given together")
 
     repo_root = Path(__file__).resolve().parents[3]
     load_repo_env(repo_root)
@@ -338,21 +463,25 @@ def main(argv: list[str] | None = None) -> int:
         _log("[prebake] validating Docker Hub credentials (token-scoped config, ~/.docker untouched)")
         verify_dockerhub_credentials(username=username, token=token, image_ref=args.repo)
 
-    cleanup_orphaned_containers()
-
-    instance_ids = load_all_instance_ids(args.dataset, args.split)
-    excluded = [i for i in instance_ids if is_excluded_instance(i)]
-    if excluded:
-        instance_ids = [i for i in instance_ids if not is_excluded_instance(i)]
-        _log(
-            f"[prebake] excluding {len(excluded)} instance(s) matching "
-            f"{', '.join(EXCLUDED_INSTANCE_PREFIXES)} (not pre-baked)"
-        )
-    if args.select:
-        selected = load_selected_instance_ids(args.select)
-        instance_ids = [i for i in instance_ids if i in selected]
-    if args.limit > 0:
-        instance_ids = instance_ids[: args.limit]
+    if args.instance_id:
+        # Single-instance mode: no dataset, no --select/--limit, and deliberately no
+        # cleanup_orphaned_containers() -- see the --instance-id help text above for why.
+        instance_ids = [args.instance_id]
+    else:
+        cleanup_orphaned_containers()
+        instance_ids = load_all_instance_ids(args.dataset, args.split)
+        excluded = [i for i in instance_ids if is_excluded_instance(i)]
+        if excluded:
+            instance_ids = [i for i in instance_ids if not is_excluded_instance(i)]
+            _log(
+                f"[prebake] excluding {len(excluded)} instance(s) matching "
+                f"{', '.join(EXCLUDED_INSTANCE_PREFIXES)} (not pre-baked)"
+            )
+        if args.select:
+            selected = load_selected_instance_ids(args.select)
+            instance_ids = [i for i in instance_ids if i in selected]
+        if args.limit > 0:
+            instance_ids = instance_ids[: args.limit]
 
     namespace = args.namespace if args.namespace is not None else resolve_swebench_namespace(None)
 
@@ -360,7 +489,11 @@ def main(argv: list[str] | None = None) -> int:
     plan: list[tuple[str, str, str]] = []
     skipped = 0
     for scan_index, instance_id in enumerate(instance_ids, start=1):
-        source_image = derive_swebench_instance_image(instance_id, namespace=namespace)
+        source_image = (
+            args.source_image
+            if args.instance_id
+            else derive_swebench_instance_image(instance_id, namespace=namespace)
+        )
         target_image = derive_prebaked_dind_image(instance_id, repo=args.repo)
         if not args.force and push and image_exists_on_registry(target_image):
             skipped += 1

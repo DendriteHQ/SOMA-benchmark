@@ -89,6 +89,71 @@ def derive_prebaked_dind_image(instance_id: str, *, repo: str) -> str:
     return f"{repo}:{derive_prebaked_dind_tag(instance_id)}"
 
 
+#: A SOMA task's own env image lives under a namespace this worker owns (see
+#: soma_tasks.task_image), never the public "swebench" one above -- so it is baked
+#: into, and resolved from, a repo of its own. The tag scheme is unchanged
+#: (derive_prebaked_dind_tag/derive_prebaked_dind_image take any instance id, SOMA
+#: task ids included).
+DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO_ENV = "SOMA_TASK_DIND_PREBAKED_REPO"
+
+#: Repo name a SOMA task's baked dind image defaults to, alongside the repo its own
+#: env image lives in. Must stay equal to quality_worker.config's
+#: DEFAULT_PREBAKE_REPOSITORY -- that is the producer of these images and this is the
+#: consumer, and nothing checks the two agree at runtime (a mismatch just looks like
+#: "no baked image exists", i.e. a silent fall back to the slow path).
+DEFAULT_SOMA_TASK_DIND_REPOSITORY = "soma-is-task-dind"
+
+
+def _strip_tag_and_digest(image_ref: str) -> str:
+    """``ns/repo:tag`` or ``host:5000/ns/repo@sha256:...`` -> ``ns/repo`` / ``host:5000/ns/repo``.
+
+    The tag separator is only the last ``:`` that comes *after* the last ``/`` -- a
+    registry host's port colon looks identical otherwise.
+    """
+    ref = image_ref.split("@", 1)[0]
+    tail_start = ref.rfind("/") + 1
+    colon = ref.find(":", tail_start)
+    return ref[:colon] if colon != -1 else ref
+
+
+def default_soma_task_dind_repo(env_image_ref: str | None) -> str | None:
+    """The repo a SOMA task's baked dind image is expected in, derived from its env image.
+
+    A SOMA task's env image reference is carried in the task row itself (see
+    :func:`soma_tasks.task_image`), and quality-worker bakes that task's dind image
+    into a sibling repo of it -- same registry, same namespace, a different repo name.
+    Deriving the default from the reference rather than hardcoding a namespace is what
+    lets a plain ``benchmark-solve`` (no issue-scout, no worker, no configuration) still
+    find a baked image, while keeping this checkout free of any one deployment's
+    account name. ``SOMA_TASK_DIND_PREBAKED_REPO`` still overrides it outright.
+
+    Returns ``None`` for a reference with no namespace component: replacing the sole
+    path segment of a bare ``soma-is-tasks:tag`` would name a Docker Hub *library*
+    repo this project does not own, so there is nothing sensible to guess.
+    """
+    if not env_image_ref or not env_image_ref.strip():
+        return None
+    path = _strip_tag_and_digest(env_image_ref.strip())
+    prefix, separator, _repo = path.rpartition("/")
+    if not separator:
+        return None
+    return f"{prefix}/{DEFAULT_SOMA_TASK_DIND_REPOSITORY}"
+
+
+def resolve_soma_task_dind_repo(runtime_options: Mapping[str, Any] | None = None) -> str | None:
+    raw_value: Any = None
+    if runtime_options and "soma_task_dind_prebaked_repo" in runtime_options:
+        raw_value = runtime_options["soma_task_dind_prebaked_repo"]
+    elif DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO_ENV in os.environ:
+        raw_value = os.getenv(DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO_ENV)
+
+    if isinstance(raw_value, str):
+        repo = raw_value.strip()
+        return repo or None
+
+    return None
+
+
 def resolve_prebaked_dind_repo(runtime_options: Mapping[str, Any] | None = None) -> str | None:
     raw_value: Any = None
     if runtime_options and "swebench_dind_prebaked_repo" in runtime_options:

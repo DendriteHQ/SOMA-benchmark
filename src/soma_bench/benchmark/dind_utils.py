@@ -12,6 +12,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from .registry_auth import docker_env_for_image
+
 DIND_START_RETRIES = 60
 DIND_START_SLEEP_SECONDS = 0.5
 
@@ -40,7 +42,7 @@ def ensure_docker_image_available(image_ref: str, *, role: str) -> None:
     if docker_image_exists(image_ref):
         return
 
-    pull_result = run_command(["docker", "pull", image_ref])
+    pull_result = run_command(["docker", "pull", image_ref], env=docker_env_for_image(image_ref))
     if pull_result.returncode == 0 and docker_image_exists(image_ref):
         return
 

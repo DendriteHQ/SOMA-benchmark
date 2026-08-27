@@ -65,6 +65,11 @@ services:
     volumes:
       - copilot-workspace:/workspace
       - copilot-dind-certs:/certs/client
+    # The default 10s SIGTERM grace period is often too short for the nested dockerd to
+    # shut down its own containers and release the copilot-workspace mount cleanly, which
+    # leaves `docker compose down` failing with "Error while Stopping" and the subsequent
+    # `docker volume rm` failing with "volume is in use" on an otherwise-successful run.
+    stop_grace_period: 30s
     profiles:
       - copilot-sidecars
     networks:

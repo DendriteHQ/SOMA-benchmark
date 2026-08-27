@@ -1500,16 +1500,32 @@ def _seed_workspace_volume_from_sandbox_image(
     return True
 
 
+# `docker compose down` sends SIGTERM to the privileged dind sidecar, which also mounts
+# this volume at /workspace. Its nested dockerd doesn't always release the mount by the
+# time `down` returns - especially when it gets SIGKILLed after missing its stop grace
+# period - so an immediate `volume rm` can transiently fail with "volume is in use" even
+# though the container is on its way out. Retry briefly instead of giving up on the first
+# attempt.
+_WORKSPACE_VOLUME_REMOVE_ATTEMPTS = 5
+_WORKSPACE_VOLUME_REMOVE_RETRY_DELAY_SECONDS = 2.0
+
+
 def _remove_workspace_volume(*, volume_name: str) -> None:
-    result = _run_command(["docker", "volume", "rm", "-f", volume_name])
-    if result.returncode != 0:
+    details = ""
+    for attempt in range(1, _WORKSPACE_VOLUME_REMOVE_ATTEMPTS + 1):
+        result = _run_command(["docker", "volume", "rm", "-f", volume_name])
+        if result.returncode == 0:
+            return
         details = (result.stderr or result.stdout or "").strip()
         if "No such volume" in details:
             return
-        emit_progress(
-            f"[copilot] failed to remove workspace volume {volume_name}: {details}",
-            component="copilot",
-        )
+        if "volume is in use" not in details or attempt == _WORKSPACE_VOLUME_REMOVE_ATTEMPTS:
+            break
+        time.sleep(_WORKSPACE_VOLUME_REMOVE_RETRY_DELAY_SECONDS)
+    emit_progress(
+        f"[copilot] failed to remove workspace volume {volume_name}: {details}",
+        component="copilot",
+    )
 
 
 def _capture_workspace_patch(*, volume_name: str, tmp_run_dir: Path, base_commit: str | None = None) -> dict[str, Any]:

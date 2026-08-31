@@ -57,15 +57,52 @@ def _extract_messages(payload: dict[str, Any]) -> list[Any]:
     return []
 
 
+def _log_message_content_enabled() -> bool:
+    """Whether to log raw conversation content.
+
+    Off by default. This service sits on the request path of a hosted product whose
+    privacy policy states that prompt content is not retained; stdout here is
+    captured by the container runtime and lands on disk, so logging the payload
+    would quietly make that untrue. Turn it on for local benchmarking only:
+
+        COMPRESSION_LOG_MESSAGE_CONTENT=1
+    """
+    return _coerce_bool(os.getenv("COMPRESSION_LOG_MESSAGE_CONTENT"), default=False)
+
+
+def _message_shape(messages: list[Any]) -> dict[str, Any]:
+    """Size/shape of a conversation, carrying no content of its own.
+
+    Enough to see traffic and to compare in/out sizes, which is what these events
+    are actually used for; the text itself is never needed for that.
+    """
+    roles: dict[str, int] = {}
+    chars = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            roles["_non_dict"] = roles.get("_non_dict", 0) + 1
+            continue
+        roles[str(m.get("role", "unknown"))] = roles.get(str(m.get("role", "unknown")), 0) + 1
+        for value in m.values():
+            if isinstance(value, str):
+                chars += len(value)
+    return {"message_count": len(messages), "content_chars": chars, "roles": roles}
+
+
 def _emit_message_event(*, request_id: str, stage: str, path: str, query: str, payload: dict[str, Any]) -> None:
     marker = f"[compression-service][messages.{stage}]"
-    entry = {
+    messages = _extract_messages(payload)
+    entry: dict[str, Any] = {
         "request_id": request_id,
         "path": path,
         "query": query,
         "model": payload.get("model"),
-        "messages": _extract_messages(payload),
     }
+    if _log_message_content_enabled():
+        entry["messages"] = messages
+    else:
+        entry.update(_message_shape(messages))
+        entry["content_redacted"] = True
     print(f"{marker} {json.dumps(entry, ensure_ascii=False)}", flush=True)
 
 

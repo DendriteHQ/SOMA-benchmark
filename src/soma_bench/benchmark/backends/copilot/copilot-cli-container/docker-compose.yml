@@ -65,6 +65,7 @@ services:
     volumes:
       - copilot-workspace:/workspace
       - copilot-dind-certs:/certs/client
+    stop_grace_period: 60s
     profiles:
       - copilot-sidecars
     networks:

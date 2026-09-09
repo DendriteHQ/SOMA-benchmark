@@ -18,6 +18,8 @@ services:
     tty: true
 
   proxy:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     image: ${COPILOT_PROXY_IMAGE:-soma-compression-service:latest}
     environment:
       - PROXY_UPSTREAM_BASE_URL=${COMPACT_BENCH_LLM_BASE_URL}

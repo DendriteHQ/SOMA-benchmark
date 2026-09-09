@@ -136,6 +136,102 @@ def _outcomes_from_report(report_payload: Any) -> dict[str, str]:
     return outcomes
 
 
+def _looks_like_test_file(path: str) -> bool:
+    normalized = path.strip().lstrip("./")
+    if not normalized:
+        return False
+    filename = normalized.rsplit("/", 1)[-1]
+    return (
+        normalized.startswith("tests/")
+        or "/tests/" in normalized
+        or normalized.startswith("test/")
+        or "/test/" in normalized
+        or filename.startswith("test_")
+        or filename.endswith(("_test.py", "_tests.py", "tests.py"))
+    )
+
+
+def _diff_touched_files(diff_text: str) -> list[str]:
+    files: list[str] = []
+    seen: set[str] = set()
+    for line in diff_text.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        match = re.match(r"diff --git a/(.+?) b/(.+)$", line)
+        if not match:
+            continue
+        for candidate in match.groups():
+            normalized = candidate.strip()
+            if normalized != "/dev/null" and normalized not in seen:
+                seen.add(normalized)
+                files.append(normalized)
+    return files
+
+
+def _strip_diff_files(diff_text: str, blocked_files: set[str]) -> tuple[str, list[str]]:
+    if not diff_text.strip():
+        return diff_text, []
+    kept: list[str] = []
+    removed: list[str] = []
+    chunks = re.split(r"(?=^diff --git )", diff_text, flags=re.MULTILINE)
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if not chunk.startswith("diff --git "):
+            kept.append(chunk)
+            continue
+        first_line = chunk.splitlines()[0]
+        match = re.match(r"diff --git a/(.+?) b/(.+)$", first_line)
+        if not match:
+            kept.append(chunk)
+            continue
+        touched = {
+            path.strip()
+            for path in match.groups()
+            if path.strip() and path.strip() != "/dev/null"
+        }
+        if touched & blocked_files:
+            removed.extend(sorted(touched & blocked_files))
+            continue
+        kept.append(chunk)
+    deduped_removed: list[str] = []
+    seen: set[str] = set()
+    for path in removed:
+        if path not in seen:
+            seen.add(path)
+            deduped_removed.append(path)
+    return "".join(kept), deduped_removed
+
+
+def _sanitize_patch_for_soma_eval(
+    *,
+    hidden_eval: Mapping[str, Any],
+    patch_path: Path,
+    output_dir: Path,
+) -> tuple[Path, dict[str, Any]]:
+    diff_text = patch_path.read_text(encoding="utf-8")
+    test_patch = str(hidden_eval.get("test_patch") or "")
+    blocked_files = {path for path in _diff_touched_files(test_patch) if _looks_like_test_file(path)}
+    if not blocked_files:
+        blocked_files = {
+            path for path in _diff_touched_files(diff_text)
+            if _looks_like_test_file(path)
+        }
+    sanitized_text, stripped_files = _strip_diff_files(diff_text, blocked_files)
+    meta = {
+        "original_patch_path": str(patch_path),
+        "blocked_test_files": sorted(blocked_files),
+        "stripped_files": stripped_files,
+    }
+    if not stripped_files:
+        meta["effective_patch_path"] = str(patch_path)
+        return patch_path, meta
+    sanitized_path = output_dir / "agent.patch.sanitized"
+    sanitized_path.write_text(sanitized_text, encoding="utf-8")
+    meta["effective_patch_path"] = str(sanitized_path)
+    return sanitized_path, meta
+
+
 def _bucket(test_ids: list[str], outcomes: Mapping[str, str]) -> tuple[dict[str, Any], list[str]]:
     successful: list[str] = []
     failed: list[str] = []
@@ -241,6 +337,11 @@ def maybe_run_soma_task_evaluation(
             "status": "error",
             "error": f"agent patch file is missing: {patch_path}",
         }
+    sanitized_patch_path, patch_sanitization = _sanitize_patch_for_soma_eval(
+        hidden_eval=hidden_eval,
+        patch_path=patch_path,
+        output_dir=output_dir,
+    )
 
     fail_to_pass_ids = _normalize_test_ids(fail_to_pass)
     pass_to_pass_ids = _normalize_test_ids(pass_to_pass)
@@ -286,11 +387,27 @@ def maybe_run_soma_task_evaluation(
         "network": network,
         "timeout": timeout,
         "patch_path": str(patch_path),
+        "effective_patch_path": str(sanitized_patch_path),
+        "patch_sanitization": patch_sanitization,
         "report_path": str(report_path),
         "test_log_path": str(test_log_path),
         "fail_to_pass_total": len(fail_to_pass_ids),
         "pass_to_pass_total": len(pass_to_pass_ids),
     }
+    if not sanitized_patch_path.is_file() or sanitized_patch_path.stat().st_size == 0:
+        return {
+            **payload,
+            "status": "completed",
+            "resolved": False,
+            "reason": "agent patch became empty after removing test-file edits",
+            "summary": {
+                "resolved": False,
+                "patch_exists": True,
+                "patch_successfully_applied": False,
+                "fail_to_pass": _bucket(fail_to_pass_ids, {})[0],
+                "pass_to_pass": _bucket(pass_to_pass_ids, {})[0],
+            },
+        }
 
     # The graded container never needs the network (the image already has every dependency
     # installed) and must not be able to reach the run's LLM proxy, so it is started detached
@@ -319,7 +436,7 @@ def maybe_run_soma_task_evaluation(
 
     try:
         copy_result = _run_command(
-            ["docker", "cp", str(patch_path), f"{container_id}:{container_patch_path}"]
+            ["docker", "cp", str(sanitized_patch_path), f"{container_id}:{container_patch_path}"]
         )
         if copy_result.returncode != 0:
             return {

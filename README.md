@@ -217,9 +217,53 @@ env var, which takes precedence over the built-in default.
 | `SOMA_COPILOT_OUTPUT_FORMAT` | `json` | `json` or `text` CLI output |
 | `SOMA_COPILOT_NETWORK_ISOLATION` | `true` | Run the CLI container without direct internet, routed through the proxy sidecar |
 | `SOMA_COPILOT_KEEP_STACK` | `false` | Keep the Compose stack up after the run instead of tearing it down |
-| `SOMA_COPILOT_SWE_SANDBOX` | `true` | Start a read-only sandbox container exposing the SWE-bench image's `/testbed` |
+| `SOMA_COPILOT_SWE_SANDBOX` | `true` | Start a read-only sandbox container exposing the task image's repo path (`/testbed` for SWE-bench, `/repo` for SOMA task lists) |
 | `SOMA_COPILOT_USE_HOST_DOCKER_SOCKET` (`--copilot-use-host-docker-socket`) | `false` | By default the SWE sandbox runs inside an isolated `dind` daemon, unreachable from the host and invisible to it. Setting this bridges the agent to the sandbox via the **host** Docker socket instead - the agent then sees and can control every container on the host, not just its own sandbox. Legacy/insecure fallback only; use if the isolated dind daemon doesn't work in your environment. |
 | `SOMA_COPILOT_SHARED_PROXY` | `true` | Reuse one proxy/compression stack across a batch instead of one per instance |
+
+### Run SOMA task lists (`tasks-*.jsonl`)
+
+SOMA task lists are not Hugging Face datasets: they are a local JSONL where every row names its
+own pair of pre-built images — an `env` image the agent works in and a `test` image the run is
+graded on. Because those images carry the environment and the graded test command, these
+instances need neither the SWE-bench image-name conventions nor its evaluation harness (none of
+their repos appear in its spec maps).
+
+Cache the task list once, then run instances from it by name:
+
+```bash
+uv run python -m soma_bench benchmark-load-tasks \
+  --tasks /path/to/tasks-1.jsonl \
+  --benchmark soma-is-tasks
+```
+
+```bash
+source .env && uv run python -m soma_bench benchmark-solve \
+  --agent-name copilot \
+  --benchmark soma-is-tasks \
+  --instance-id NVIDIA__SkillSpector-208 \
+  --execute \
+  --output-dir outputs/run-soma-tasks \
+  --swerebench-eval
+```
+
+`--benchmark` takes whatever name you cached under; `benchmark-run-infer` works the same way
+against a manifest built from it. `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` in `.env` are required
+when the task images live in a private repo — they are used for the agent's env image and the
+grading image alike, without touching `~/.docker/config.json`.
+
+Three things follow the images rather than SWE-bench defaults, automatically:
+
+- **Repo path.** The agent's working directory, the sandbox mount and `swe-exec` all take the
+  path the image declares (`/repo` for these lists) instead of `/testbed`. Override with
+  `SOMA_COPILOT_SWE_SANDBOX_REPO_PATH` if you need to.
+- **Grading.** `--swerebench-eval` runs the task's own `run_tests` script inside its `test` image
+  with the agent's patch applied, and checks `FAIL_TO_PASS`/`PASS_TO_PASS` against the pytest JSON
+  report that run produces. Results land in `metadata.patch_evaluation` and aggregate into
+  `evaluation-summary.json` exactly like SWE-bench runs do. A graded test id the report never
+  mentions counts as a failure and is listed under `patch_evaluation.missing_tests`.
+- **Grading isolation.** The grading container runs on `none` networking; set
+  `SOMA_TASK_EVAL_NETWORK` if a repo's tests genuinely need a network.
 
 ### Output layout
 

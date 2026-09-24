@@ -1320,10 +1320,9 @@ def _seed_workspace_volume(
     compose_project: str,
     repo_root: Path,
     owner: tuple[int, int] | None = None,
-    sandbox_image: str | None = None,
-    sandbox_repo_path: str | None = None,
-    base_commit: str | None = None,
 ) -> str:
+    # Seeded from the bare base_commit checkout. On the dind path _seed_workspace_in_dind
+    # replaces this with the task image's own checkout once the isolated daemon is up.
     volume_name = _workspace_volume_name(compose_project=compose_project)
     _run_command(["docker", "volume", "rm", "-f", volume_name])
     create_result = _run_command(["docker", "volume", "create", volume_name])
@@ -1333,26 +1332,7 @@ def _seed_workspace_volume(
             f"{(create_result.stderr or create_result.stdout or '').strip()}"
         )
 
-    seeded_from_image = False
-    if sandbox_image and sandbox_repo_path:
-        seeded_from_image = _seed_workspace_volume_from_sandbox_image(
-            volume_name=volume_name,
-            sandbox_image=sandbox_image,
-            sandbox_repo_path=sandbox_repo_path,
-            base_commit=base_commit,
-            owner=owner,
-        )
-        if not seeded_from_image:
-            emit_progress(
-                "[copilot] could not seed workspace from the SWE sandbox image "
-                f"{sandbox_image!r}; falling back to a bare checkout of {repo_root} "
-                "(the task image's pre-built dependencies, compiled extensions and any "
-                "generated version files will NOT be present)",
-                component="copilot",
-            )
-
-    if not seeded_from_image:
-        _seed_workspace_volume_from_repo_root(volume_name=volume_name, repo_root=repo_root, owner=owner)
+    _seed_workspace_volume_from_repo_root(volume_name=volume_name, repo_root=repo_root, owner=owner)
     return volume_name
 
 
@@ -1393,110 +1373,66 @@ def _seed_workspace_volume_from_repo_root(
         )
 
 
-def _seed_workspace_volume_from_sandbox_image(
+def _seed_workspace_in_dind(
     *,
-    volume_name: str,
+    dind_container_id: str,
     sandbox_image: str,
     sandbox_repo_path: str,
     base_commit: str | None,
     owner: tuple[int, int] | None = None,
 ) -> bool:
-    """Seed the workspace volume from the SWE-bench task image's own checkout.
+    """Replace the workspace with the task image's own checkout, inside the isolated daemon.
 
-    A bare external `git clone` (the previous, only, seeding path) can never reproduce what
-    the task image already has at its repo path: dependencies installed, native extensions
-    compiled, and any version file a build step generates (setuptools_scm's is gitignored by
-    convention - a fresh clone is guaranteed not to have it). Copying the image's own
-    checkout instead preserves all of that; we only need to move it from whatever commit the
-    image's dependency-install step left it at over to the instance's `base_commit`.
+    A bare external checkout can never reproduce what the task image already has at its
+    repo path: dependencies installed, native extensions compiled, and any version file a
+    build step generates (setuptools_scm's is gitignored by convention). Copying the image's
+    own checkout preserves all of that.
 
-    Intentionally does NOT run `git clean -dfx` afterward: that would delete exactly the
-    untracked/gitignored build artifacts (compiled extensions, generated version files) this
-    function exists to keep. `git checkout --force` already replaces every tracked file with
-    the `base_commit` version and removes tracked files that commit doesn't have; leaving
-    untracked build output in place is the point, not an oversight.
+    This runs inside dind rather than on the host because that is where the task image is:
+    a prebaked dind image carries it in its own storage, and the plain-dind path has just
+    loaded it there. The host engine may have neither the image nor credentials to pull it
+    (SOMA task images are private), which used to drop every run to the bare checkout.
 
-    Returns False (leaving the volume untouched for the caller's fallback) on any failure -
-    this is a best-effort improvement, not a hard requirement for the run to proceed.
+    Intentionally does NOT run `git clean -dfx`: that would delete exactly the untracked
+    build artifacts this exists to keep. The checkout is skipped when the image is already
+    at `base_commit`, so tracked files a build step touched stay as the image has them.
+
+    Returns False (leaving the bare checkout in place) on any failure - this is a
+    best-effort improvement, not a hard requirement for the run to proceed.
     """
     seed_mount = "/__soma_seed_target"
+    git = "git -c safe.directory='*'"
     seed_script = (
+        "set -e; "
         f"rm -rf {seed_mount}/* {seed_mount}/.[!.]* {seed_mount}/..?* 2>/dev/null || true; "
-        f"cp -a {sandbox_repo_path}/. {seed_mount}/"
+        f"cp -a {sandbox_repo_path}/. {seed_mount}/; "
+        f"cd {seed_mount}"
     )
-    copy_result = _run_command(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--entrypoint",
-            "sh",
-            "-v",
-            f"{volume_name}:{seed_mount}",
-            sandbox_image,
-            "-lc",
-            seed_script,
-        ]
-    )
-    if copy_result.returncode != 0:
+    if base_commit:
+        base = shlex.quote(base_commit)
+        seed_script += (
+            f"; [ \"$({git} rev-parse HEAD)\" = {base} ] || {git} checkout --force {base}"
+        )
+    if owner is not None:
+        seed_script += f"; chown -R {owner[0]}:{owner[1]} {seed_mount}"
+
+    result = _run_command([
+        "docker", "exec", dind_container_id, "docker", "run", "--rm",
+        "--user", "0:0",
+        "--entrypoint", "sh",
+        "-v", f"{COPILOT_DIND_WORKSPACE_MOUNT}:{seed_mount}",
+        sandbox_image,
+        "-lc", seed_script,
+    ])
+    if result.returncode != 0:
         emit_progress(
-            f"[copilot] seeding workspace from sandbox image {sandbox_image!r} failed: "
-            f"{(copy_result.stderr or copy_result.stdout or '').strip()}",
+            f"[copilot] could not seed workspace from the SWE sandbox image {sandbox_image!r} "
+            "inside dind; keeping the bare base_commit checkout (the task image's pre-built "
+            "dependencies, compiled extensions and any generated version files will NOT be "
+            f"present): {(result.stderr or result.stdout or '').strip()}",
             component="copilot",
         )
         return False
-
-    if base_commit:
-        checkout_script = (
-            f"git config --global --add safe.directory {sandbox_repo_path} 2>/dev/null || true; "
-            f"cd {sandbox_repo_path} && git checkout --force {shlex.quote(base_commit)}"
-        )
-        checkout_result = _run_command(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--entrypoint",
-                "sh",
-                "-v",
-                f"{volume_name}:{sandbox_repo_path}",
-                sandbox_image,
-                "-lc",
-                checkout_script,
-            ]
-        )
-        if checkout_result.returncode != 0:
-            emit_progress(
-                f"[copilot] could not checkout base_commit {base_commit} onto the "
-                f"image-seeded workspace: "
-                f"{(checkout_result.stderr or checkout_result.stdout or '').strip()}",
-                component="copilot",
-            )
-            return False
-
-    if owner is not None:
-        chown_result = _run_command(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "-v",
-                f"{volume_name}:/workspace",
-                "alpine:3.20",
-                "chown",
-                "-R",
-                f"{owner[0]}:{owner[1]}",
-                "/workspace",
-            ]
-        )
-        if chown_result.returncode != 0:
-            emit_progress(
-                f"[copilot] could not chown image-seeded workspace to {owner[0]}:{owner[1]}: "
-                f"{(chown_result.stderr or chown_result.stdout or '').strip()}",
-                component="copilot",
-            )
-            return False
-
     return True
 
 
@@ -2140,26 +2076,21 @@ def _prepare_instance_repo_checkout(context: RuntimeExecutionContext) -> tuple[P
     repo_dir = workspace_root / "repo"
     workspace_root.mkdir(parents=True, exist_ok=True)
 
-    if (repo_dir / ".git").is_dir():
-        remote_result = _run_command(["git", "-C", str(repo_dir), "remote", "get-url", "origin"])
-        existing_origin = (remote_result.stdout or "").strip() if remote_result.returncode == 0 else ""
-        if existing_origin and existing_origin != clone_url:
-            shutil.rmtree(repo_dir, ignore_errors=True)
-
-    if not (repo_dir / ".git").is_dir():
-        clone_result = _run_command([
-            "git",
-            "clone",
-            "--filter=blob:none",
-            clone_url,
-            str(repo_dir),
-        ])
-        if clone_result.returncode != 0:
+    # Fetch base_commit alone instead of cloning. Any clone - even --filter=blob:none -
+    # brings every later upstream commit, its message and its tree along with the refs
+    # pointing at them, and this checkout can end up as the agent's workspace, where
+    # `git log --all` would show it the commit that fixed the task. Always from scratch,
+    # so a checkout left by an older full clone is never reused.
+    shutil.rmtree(repo_dir, ignore_errors=True)
+    for init_args in (["init", "-q", str(repo_dir)], ["-C", str(repo_dir), "remote", "add", "origin", clone_url]):
+        init_result = _run_command(["git", *init_args])
+        if init_result.returncode != 0:
             raise RuntimeError(
-                "Failed to clone benchmark repository for Copilot backend. "
-                f"{(clone_result.stderr or clone_result.stdout or '').strip()}"
+                "Failed to initialize benchmark repository for Copilot backend. "
+                f"{(init_result.stderr or init_result.stdout or '').strip()}"
             )
 
+    # The fallback fetches base_commit with its ancestors: still nothing after it.
     fetch_result = _run_command(["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", base_commit])
     if fetch_result.returncode != 0:
         fallback_fetch = _run_command(["git", "-C", str(repo_dir), "fetch", "origin", base_commit])
@@ -2462,24 +2393,12 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             f"{workspace_owner[0]}:{workspace_owner[1]} (agent user in {agent_image})",
             component="copilot",
         )
-    # Seeding from the task image itself (rather than only ever from a bare external clone)
-    # preserves whatever that image's own dependency-install step already built at the repo
-    # path - compiled extensions, editable-install metadata, generated version files - none
-    # of which a fresh `git clone` can ever have. Only applies on the dind path: the
-    # host-docker-socket fallback talks to the sandbox container directly rather than
-    # through this shared volume, and with no sandbox image at all there is nothing to seed
-    # from but the clone.
+    # The bare base_commit checkout for now; on the dind path it is replaced with the task
+    # image's own checkout once the isolated daemon is up (_seed_workspace_in_dind).
     workspace_volume = _seed_workspace_volume(
         compose_project=compose_project,
         repo_root=repo_root,
         owner=workspace_owner,
-        sandbox_image=(
-            swe_sandbox_image
-            if compose_swe_sandbox_enabled and not use_host_docker_socket
-            else None
-        ),
-        sandbox_repo_path=swe_sandbox_repo_path,
-        base_commit=base_commit,
     )
     env["COPILOT_WORKSPACE_VOLUME_NAME"] = workspace_volume
     # Set unconditionally: the compose file interpolates this into the agent container's own
@@ -2673,6 +2592,20 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 image=swe_sandbox_image,
                 role="Copilot SWE sandbox",
             )
+            # Before the sandbox starts, so it mounts the seeded workspace; the agent
+            # container is not up yet either.
+            if _seed_workspace_in_dind(
+                dind_container_id=dind_container_id,
+                sandbox_image=swe_sandbox_image,
+                sandbox_repo_path=swe_sandbox_repo_path,
+                base_commit=base_commit,
+                owner=workspace_owner,
+            ):
+                emit_progress(
+                    f"[{context.instance.instance_id}] seeded workspace from the SWE sandbox "
+                    f"image {swe_sandbox_image!r} inside dind",
+                    component="copilot",
+                )
             swe_sandbox_container_name = swe_sandbox_service
             swe_sandbox_container_id = _start_nested_swe_sandbox(
                 dind_container_id=dind_container_id,

@@ -2027,6 +2027,12 @@ def _extract_proxy_token_usage(*, sidecar_log_paths: dict[str, str]) -> dict[str
     return last_usage
 
 
+#: `docker compose logs --timestamps` stores a log line longer than 16 KiB as several
+#: partial records and prints each one with its own timestamp, so a long marker line
+#: comes back with "<timestamp> " spliced in every 16 KiB - usually breaking its JSON.
+_DOCKER_SPLIT_TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}Z ")
+
+
 def _extract_message_request_logs(*, sidecar_log_paths: dict[str, str], destination_dir: Path) -> dict[str, str]:
     in_marker = "[compression-service][messages.in] "
     out_marker = "[compression-service][messages.out] "
@@ -2044,6 +2050,9 @@ def _extract_message_request_logs(*, sidecar_log_paths: dict[str, str], destinat
         if not candidate_path.is_file():
             continue
         for line in candidate_path.read_text(encoding="utf-8").splitlines():
+            if "[compression-service][" in line:
+                head, sep, rest = line.partition("[compression-service][")
+                line = head + sep + _DOCKER_SPLIT_TIMESTAMP.sub("", rest)
             if in_marker in line:
                 incoming_entries.append(line.split(in_marker, 1)[1].strip())
             if out_marker in line:
@@ -2059,6 +2068,7 @@ def _extract_message_request_logs(*, sidecar_log_paths: dict[str, str], destinat
         outgoing_path = destination_dir / "messages-out.jsonl"
         outgoing_path.write_text("\n".join(outgoing_entries) + "\n", encoding="utf-8")
         extracted_paths["messages_out_path"] = str(outgoing_path)
+
 
     return extracted_paths
 

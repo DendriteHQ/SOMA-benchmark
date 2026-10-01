@@ -17,6 +17,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app import services as _services
+
 COMPRESSOR_CANDIDATE_NAMES = (
     "compress_messages",
     "compress_payload",
@@ -32,6 +34,17 @@ class TransformRequest(BaseModel):
     query: str = ""
     request_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+    # Read-only facts about the request that are not in the payload, e.g. the
+    # protected task prompt ({"task": ...}). Offered to a compressor that
+    # takes `metadata`; never forwarded upstream.
+    context: dict[str, Any] = Field(default_factory=dict)
+    # Services the proxy offers on this turn (soma-compressor-services/1). Absent: none.
+    services: dict[str, Any] | None = None
+
+
+class ResumeRequest(BaseModel):
+    session: str
+    results: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TransformResponse(BaseModel):
@@ -135,7 +148,13 @@ _COMPRESSOR_MODULE = _load_compressor_module()
 _COMPRESSOR_FN = _resolve_compressor_callable(_COMPRESSOR_MODULE)
 
 
-def _invoke_compressor(payload: dict[str, Any], *, path: str) -> dict[str, Any]:
+def _invoke_compressor(
+    payload: dict[str, Any],
+    *,
+    path: str,
+    context: dict[str, Any] | None = None,
+    services: _services.Services | None = None,
+) -> dict[str, Any]:
     if _COMPRESSOR_FN is None:
         return payload
 
@@ -154,7 +173,9 @@ def _invoke_compressor(payload: dict[str, Any], *, path: str) -> dict[str, Any]:
         if "path" in parameters:
             kwargs["path"] = path
         if "metadata" in parameters:
-            kwargs["metadata"] = {"path": path}
+            kwargs["metadata"] = {**(context or {}), "path": path}
+        if "services" in parameters:
+            kwargs["services"] = services if services is not None else _services.Services({}, None)
 
     result: Any
     if kwargs:
@@ -181,6 +202,8 @@ def _invoke_compressor_logged(
     *,
     path: str,
     request_id: str,
+    context: dict[str, Any] | None = None,
+    services: _services.Services | None = None,
 ) -> dict[str, Any]:
     """Invoke the miner compressor and emit a per-invocation execution log event.
 
@@ -198,7 +221,7 @@ def _invoke_compressor_logged(
     with _COMPRESSOR_EXEC_LOCK:
         try:
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
-                result = _invoke_compressor(payload, path=path)
+                result = _invoke_compressor(payload, path=path, context=context, services=services)
         except Exception as exc:  # noqa: BLE001
             error = exc
             error_traceback = traceback.format_exc()
@@ -237,8 +260,57 @@ def health() -> JSONResponse:
     )
 
 
-@app.post("/transform", response_model=TransformResponse)
-def transform_payload(request: TransformRequest) -> TransformResponse:
+def _miner_takes_services() -> bool:
+    try:
+        return _COMPRESSOR_FN is not None and "services" in inspect.signature(_COMPRESSOR_FN).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_SESSIONS = _services.SessionStore()
+
+
+def _session_answer(session: _services.Session, request: TransformRequest) -> JSONResponse:
+    """Wait for the suspended miner's next move and turn it into the HTTP answer."""
+    kind, value = session.next_event()
+    if kind == "pending":
+        return JSONResponse({"pending": value})
+    _SESSIONS.drop(session.id)
+    if kind == "error":
+        if isinstance(value, HTTPException):
+            raise value
+        raise HTTPException(status_code=500, detail=f"compressor error: {value}")
+    return JSONResponse({"payload": _finish_transform(request, value)})
+
+
+def _finish_transform(request: TransformRequest, transformed: Any) -> dict[str, Any]:
+    if not isinstance(transformed, dict):
+        raise HTTPException(status_code=500, detail="compressor returned unsupported payload type")
+    _emit_message_event(
+        request_id=(request.request_id or "").strip() or "no-request-id",
+        stage="out",
+        path=request.path,
+        query=request.query,
+        payload=transformed,
+    )
+    return transformed
+
+
+@app.post("/transform/resume")
+def transform_resume(request: ResumeRequest) -> JSONResponse:
+    session = _SESSIONS.get(request.session)
+    if session is None:
+        raise HTTPException(status_code=404, detail="unknown or expired session")
+    try:
+        session.deliver(request.results)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # messages.out is emitted against the /transform request that started the session.
+    return _session_answer(session, session.request)
+
+
+@app.post("/transform")
+def transform_payload(request: TransformRequest) -> JSONResponse:
     if not isinstance(request.payload, dict):
         raise HTTPException(status_code=400, detail="payload must be an object")
 
@@ -251,20 +323,33 @@ def transform_payload(request: TransformRequest) -> TransformResponse:
         payload=request.payload,
     )
 
-    transformed = _invoke_compressor_logged(
-        request.payload,
-        path=request.path,
-        request_id=request_id,
-    )
+    offer = _services.parse_offer(request.services)
+    if offer is None or not _miner_takes_services():
+        transformed = _invoke_compressor_logged(
+            request.payload,
+            path=request.path,
+            request_id=request_id,
+            context=request.context,
+        )
+        return JSONResponse({"payload": _finish_transform(request, transformed)})
 
-    if not isinstance(transformed, dict):
-        raise HTTPException(status_code=500, detail="compressor returned unsupported payload type")
+    # The miner may call services: run it in a worker so it can be suspended between
+    # rounds, and answer this request with its first move (see app/services.py).
+    session = _services.Session(offer)
+    session.request = request
+    _SESSIONS.add(session)
 
-    _emit_message_event(
-        request_id=request_id,
-        stage="out",
-        path=request.path,
-        query=request.query,
-        payload=transformed,
-    )
-    return TransformResponse(payload=transformed)
+    def work() -> None:
+        try:
+            session.finish(_invoke_compressor_logged(
+                request.payload,
+                path=request.path,
+                request_id=request_id,
+                context=request.context,
+                services=session.services,
+            ))
+        except BaseException as exc:  # noqa: BLE001 - delivered to the waiting handler
+            session.finish(error=exc)
+
+    threading.Thread(target=work, name=f"miner-{session.id[:8]}", daemon=True).start()
+    return _session_answer(session, request)

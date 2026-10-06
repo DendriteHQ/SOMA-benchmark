@@ -35,8 +35,16 @@ def _ask_jev(messages: list[Any], metadata: dict[str, Any] | None, services: Any
         "last_tool_output": _text(last_tool.get("content"))[:PREVIEW_CHARS],
     }
     # Keys are ids we choose; Jev answers under the same keys in result["answers"].
+    # Each question is a typed object; "noul" is Jev's yes/no type and returns P(yes).
     questions = {
-        "last_tool_output_failed": "Does last_tool_output show a command error or failure? Answer yes or no.",
+        "last_tool_output_failed": {
+            "type": "noul",
+            "instructions": "Does last_tool_output show a command error or failure?",
+            "criteria": {
+                "true": "The tool output shows an error, exception, traceback, non-zero exit or failed command.",
+                "false": "The tool output shows the command completed normally.",
+            },
+        },
     }
     try:
         result = services.jev.decide(state=state, questions=questions)

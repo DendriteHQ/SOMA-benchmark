@@ -4,8 +4,10 @@ import asyncio
 import gzip
 import json
 import os
+import time
 import uuid
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
@@ -42,6 +44,34 @@ _token_totals: dict[str, int] = {
 }
 
 TOKEN_USAGE_LOG_MARKER = "[proxy][token-usage] "
+SERVICE_CALL_LOG_MARKER = "[proxy][service-call] "
+SERVICE_USAGE_LOG_MARKER = "[proxy][service-usage] "
+
+#: Compressor services. The compression service cannot open a
+#: connection anywhere, so a miner's service call comes back in its /transform answer
+#: as `pending`, this proxy executes it, and /transform/resume carries the result in.
+COMPRESSOR_SERVICES_PROTOCOL = "soma-compressor-services/1"
+#: What a miner may ask of Jev on one agent turn. The proxy is the only place these
+#: are enforced: the miner is a file the run mounts and can be anything.
+#: The deadline is the real limit (the agent waits for the whole turn); rounds and
+#: calls are only a guard against a looping miner, since Jev's cost is in the score.
+JEV_OFFER: dict[str, Any] = {
+    "ops": ["decide"],
+    "default_model": "jev-latest",
+    "models": ["jev-latest", "jev-1.13"],
+    "max_rounds": 50,
+    "max_calls": 500,
+    "max_calls_per_round": 16,
+    "max_request_bytes": 262144,
+    "deadline_ms": 20000,
+}
+#: OpenRouter's System One endpoint, relative to the upstream base URL.
+JEV_UPSTREAM_PATH = "systemone"
+_SERVICE_POOL = ThreadPoolExecutor(max_workers=JEV_OFFER["max_calls_per_round"])
+#: Cumulative cost of compressor services for this run (one proxy per run), kept
+#: apart from _token_totals: it is part of what the run spent, not what the agent did.
+#: Jev bills input only, so input_tokens is the whole of its token cost.
+_service_totals: dict[str, dict[str, float]] = {}
 
 
 def _decompress_for_parsing(body: bytes, content_encoding: str) -> bytes:
@@ -330,6 +360,180 @@ def _restore_protected_prompts(payload: dict[str, Any], protected: dict[str, Any
     return restored_payload
 
 
+def _task_context(protected: dict[str, Any]) -> dict[str, Any]:
+    """Read-only view of the protected first user prompt, for a compressor to rank by.
+
+    The prompt itself stays stripped from the payload, so the compressor still cannot
+    change it; it only learns what the agent was asked to do.
+    """
+    for _, message in protected.get("messages") or []:
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, list):
+                content = "\n".join(
+                    part.get("text", "") for part in content if isinstance(part, dict) and isinstance(part.get("text"), str)
+                )
+            if isinstance(content, str) and content:
+                return {"task": content}
+    return {}
+
+
+def _resolve_compressor_services_offer() -> dict[str, Any] | None:
+    """The `services` field of /transform: what this proxy lets the miner call."""
+    raw = os.getenv("PROXY_COMPRESSOR_SERVICES", "jev")
+    names = {n.strip().lower() for n in raw.split(",") if n.strip()}
+    offer: dict[str, Any] = {}
+    if "jev" in names:
+        offer["jev"] = dict(JEV_OFFER)
+    return {"protocol": COMPRESSOR_SERVICES_PROTOCOL, "offer": offer} if offer else None
+
+
+def _service_error(call_id: Any, code: str, message: str) -> dict[str, Any]:
+    return {"id": call_id, "ok": False, "error": {"code": code, "message": message}}
+
+
+def _execute_jev_call(body: dict[str, Any], *, headers: dict[str, str], timeout: float) -> tuple[bool, Any]:
+    url = _build_upstream_url(base_url=_UPSTREAM_BASE_URL, path=JEV_UPSTREAM_PATH, query="")
+    if urlsplit(url).netloc != _UPSTREAM_NETLOC:
+        return False, {"code": "invalid_request", "message": "upstream host mismatch"}
+    request = UrlRequest(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={**headers, "content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            parsed = json.loads(response.read())
+    except HTTPError as exc:
+        detail = exc.read()[:300].decode("utf-8", "replace")
+        return False, {"code": "upstream_error", "message": f"HTTP {exc.code}: {detail}"}
+    except (URLError, TimeoutError, OSError) as exc:
+        return False, {"code": "timeout" if "timed out" in str(exc) else "upstream_error", "message": str(exc)}
+    except ValueError as exc:
+        return False, {"code": "upstream_error", "message": f"invalid JSON: {exc}"}
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("answers"), dict):
+        return False, {"code": "upstream_error", "message": "response has no answers"}
+    usage = parsed.get("usage")
+    input_tokens = usage.get("input_tokens") if isinstance(usage, dict) else None
+    if not (isinstance(input_tokens, int) and not isinstance(input_tokens, bool) and input_tokens > 0):
+        return False, {"code": "upstream_error", "message": "response has no usable usage"}
+    return True, {k: parsed[k] for k in ("model", "answers", "usage") if k in parsed}
+
+
+class _ServiceBudget:
+    """Limits of one agent turn, counted across all its rounds."""
+
+    def __init__(self, offer: dict[str, Any]) -> None:
+        self.offer = offer
+        self.started = time.monotonic()
+        self.rounds = 0
+        self.calls = 0
+
+    def remaining_s(self, service: str) -> float:
+        limit = (self.offer.get(service) or {}).get("deadline_ms", 0) / 1000.0
+        return limit - (time.monotonic() - self.started)
+
+
+def _run_service_round(
+    pending: dict[str, Any],
+    *,
+    budget: _ServiceBudget,
+    headers: dict[str, str],
+    request_id: str,
+) -> list[dict[str, Any]]:
+    """Answer every call of one `pending` round. Never raises for a bad call: a call
+    the proxy will not or cannot execute gets an error result and the turn goes on."""
+    calls = pending.get("calls") if isinstance(pending.get("calls"), list) else []
+    budget.rounds += 1
+    results: dict[Any, dict[str, Any]] = {}
+    runnable: list[tuple[Any, dict[str, Any]]] = []
+    for call in calls:
+        cid = call.get("id") if isinstance(call, dict) else None
+        service = call.get("service") if isinstance(call, dict) else None
+        offer = budget.offer.get(service) if isinstance(service, str) else None
+        req = call.get("request") if isinstance(call, dict) else None
+        if offer is None:
+            results[cid] = _service_error(cid, "not_offered", f"service {service!r} is not offered")
+            continue
+        if call.get("op") not in offer["ops"] or not isinstance(req, dict):
+            results[cid] = _service_error(cid, "invalid_request", "unknown op or missing request")
+            continue
+        body = {"model": req.get("model") or offer["default_model"], "state": req.get("state"),
+                "questions": req.get("questions")}
+        if not isinstance(body["model"], str) or body["model"] not in offer["models"]:
+            results[cid] = _service_error(cid, "invalid_request", f"model {body['model']!r} is not offered")
+            continue
+        if body["state"] is None or not isinstance(body["questions"], dict) or not body["questions"]:
+            results[cid] = _service_error(cid, "invalid_request", "state and questions are required")
+            continue
+        if len(json.dumps(body, ensure_ascii=False)) > offer["max_request_bytes"]:
+            results[cid] = _service_error(cid, "invalid_request", "request too large")
+            continue
+        if (budget.rounds > offer["max_rounds"] or budget.calls >= offer["max_calls"]
+                or len(runnable) >= offer["max_calls_per_round"] or budget.remaining_s(service) <= 0.2):
+            results[cid] = _service_error(cid, "budget_exhausted", "rounds, calls or deadline of this turn used up")
+            continue
+        budget.calls += 1
+        runnable.append((cid, body))
+
+    def run(item: tuple[Any, dict[str, Any]]) -> tuple[Any, bool, Any, float]:
+        cid, body = item
+        started = time.monotonic()
+        ok, value = _execute_jev_call(body, headers=headers, timeout=max(budget.remaining_s("jev"), 0.2))
+        return cid, ok, value, (time.monotonic() - started) * 1000.0
+
+    for cid, ok, value, ms in _SERVICE_POOL.map(run, runnable):
+        body = dict(runnable)[cid]
+        results[cid] = {"id": cid, "ok": True, "response": value} if ok else {"id": cid, **_service_error(cid, value["code"], value["message"])}
+        entry = {
+            "request_id": request_id, "session": pending.get("session"), "round": pending.get("round"),
+            "id": cid, "service": "jev", "model": value.get("model") if ok else body["model"], "ok": ok,
+            "ms": round(ms), "state_chars": len(body["state"]) if isinstance(body["state"], str) else len(json.dumps(body["state"])),
+            "questions": len(body["questions"]),
+        }
+        if ok:
+            entry["usage"] = value.get("usage")
+            usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
+            totals = _service_totals.setdefault("jev", {"calls": 0, "input_tokens": 0, "cost": 0.0})
+            totals["calls"] += 1
+            totals["input_tokens"] += int(usage.get("input_tokens") or 0)
+            totals["cost"] = round(totals["cost"] + float(usage.get("cost") or 0.0), 10)
+        else:
+            entry["error"] = value
+        print(f"{SERVICE_CALL_LOG_MARKER}{json.dumps(entry)}", flush=True)
+    if runnable:
+        print(f"{SERVICE_USAGE_LOG_MARKER}{json.dumps(_service_totals)}", flush=True)
+    for cid, result in results.items():
+        if not result.get("ok") and cid not in dict(runnable):
+            print(f"{SERVICE_CALL_LOG_MARKER}{json.dumps({'request_id': request_id, 'session': pending.get('session'), 'round': pending.get('round'), 'id': cid, 'ok': False, 'error': result['error']})}", flush=True)
+    return [results[c.get("id") if isinstance(c, dict) else None] for c in calls]
+
+
+def _post_compression_service(url: str, body: dict[str, Any]) -> Any:
+    request = UrlRequest(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=_resolve_compression_timeout_seconds()) as response:
+        return json.loads(response.read())
+
+
+def _service_auth_headers(request: Request, *, override_api_key: str) -> dict[str, str]:
+    """Credentials for a service call: the same identity as the agent request it
+    serves, so the cost lands on that run's key. Never shown to the miner."""
+    headers: dict[str, str] = {}
+    auth = f"Bearer {override_api_key}" if override_api_key else request.headers.get("authorization", "")
+    if auth:
+        headers["Authorization"] = auth
+    run_id_header_value = _resolve_run_id_header_value()
+    if run_id_header_value:
+        headers["X-Run-Id"] = run_id_header_value
+    return headers
+
+
 def _transform_payload_via_compression_service(
     *,
     path: str,
@@ -337,26 +541,36 @@ def _transform_payload_via_compression_service(
     payload: dict[str, Any],
     request_id: str,
     compression_base_url: str,
+    context: dict[str, Any] | None = None,
+    service_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     transform_url = _build_upstream_url(base_url=compression_base_url, path="transform", query="")
-    request_body = json.dumps(
-        {
-            "path": f"/{path}" if path else "/",
-            "query": query,
-            "payload": payload,
-            "request_id": request_id,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    compression_request = UrlRequest(
-        transform_url,
-        data=request_body,
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-    with urlopen(compression_request, timeout=_resolve_compression_timeout_seconds()) as response:
-        raw = response.read()
-    parsed = json.loads(raw)
+    services = _resolve_compressor_services_offer() if service_headers is not None else None
+    body: dict[str, Any] = {
+        "path": f"/{path}" if path else "/",
+        "query": query,
+        "payload": payload,
+        "request_id": request_id,
+        "context": context or {},
+    }
+    if services is not None:
+        body["services"] = services
+    parsed = _post_compression_service(transform_url, body)
+    if services is not None:
+        budget = _ServiceBudget(services["offer"])
+        resume_url = _build_upstream_url(base_url=compression_base_url, path="transform/resume", query="")
+        # Bounded by the service: every call over budget is answered with an error,
+        # and each answer makes the miner either finish or ask again.
+        while isinstance(parsed, dict) and isinstance(parsed.get("pending"), dict):
+            # A miner that keeps asking after its budget is gone gets error results
+            # for free; past twice the round limit or the deadline it is a failed
+            # compression, handled like any other.
+            if budget.rounds >= 2 * max(o["max_rounds"] for o in budget.offer.values()) or \
+                    min(budget.remaining_s(n) for n in budget.offer) < -5.0:
+                raise RuntimeError("compressor kept requesting services past its budget")
+            pending = parsed["pending"]
+            results = _run_service_round(pending, budget=budget, headers=service_headers or {}, request_id=request_id)
+            parsed = _post_compression_service(resume_url, {"session": pending.get("session"), "results": results})
     transformed = parsed.get("payload") if isinstance(parsed, dict) else None
     if not isinstance(transformed, dict):
         raise RuntimeError("Compression service returned invalid payload shape; expected object payload.")
@@ -406,6 +620,8 @@ async def proxy_passthrough(path: str, request: Request) -> Response:
                 payload=stripped_payload,
                 request_id=request_id,
                 compression_base_url=compression_base_url,
+                context=_task_context(protected_prompts),
+                service_headers=_service_auth_headers(request, override_api_key=override_api_key),
             )
             transformed_payload = _restore_protected_prompts(transformed_payload, protected_prompts)
             forwarded_body = json.dumps(transformed_payload, ensure_ascii=False).encode("utf-8")

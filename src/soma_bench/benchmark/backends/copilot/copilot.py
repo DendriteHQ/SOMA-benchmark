@@ -1857,7 +1857,7 @@ def _count_trajectory_steps(trajectory_path: Path) -> int | None:
 
 def _extract_jsonl_lines(stdout: str) -> str:
     valid_lines: list[str] = []
-    for raw_line in stdout.splitlines():
+    for raw_line in stdout.split("\n"):
         line = raw_line.strip()
         if not line:
             continue
@@ -2014,7 +2014,7 @@ def _extract_proxy_token_usage(*, sidecar_log_paths: dict[str, str]) -> dict[str
     if not log_file.is_file():
         return {}
     last_usage: dict[str, int] = {}
-    for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in log_file.read_text(encoding="utf-8", errors="replace").split("\n"):
         idx = line.find(_PROXY_TOKEN_USAGE_MARKER)
         if idx == -1:
             continue
@@ -2027,11 +2027,41 @@ def _extract_proxy_token_usage(*, sidecar_log_paths: dict[str, str]) -> dict[str
     return last_usage
 
 
+#: `docker compose logs --timestamps` stores a log line longer than 16 KiB as several
+#: partial records and prints each one with its own timestamp, so a long marker line
+#: comes back with "<timestamp> " spliced in every 16 KiB - usually breaking its JSON.
+_DOCKER_SPLIT_TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}Z ")
+
+
+def _extract_proxy_service_usage(*, sidecar_log_paths: dict[str, str]) -> dict[str, Any]:
+    """Last cumulative `[proxy][service-usage]` record: what compressor services (Jev)
+    cost this run, kept apart from the agent's own token_usage."""
+    log_path = sidecar_log_paths.get("proxy_log", "")
+    if not log_path or not Path(log_path).is_file():
+        return {}
+    marker = "[proxy][service-usage] "
+    last: dict[str, Any] = {}
+    for line in Path(log_path).read_text(encoding="utf-8", errors="replace").split("\n"):
+        idx = line.find(marker)
+        if idx == -1:
+            continue
+        try:
+            parsed = json.loads(line[idx + len(marker):])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            last = parsed
+    return last
+
+
 def _extract_message_request_logs(*, sidecar_log_paths: dict[str, str], destination_dir: Path) -> dict[str, str]:
     in_marker = "[compression-service][messages.in] "
     out_marker = "[compression-service][messages.out] "
+    # One line per compressor service call (e.g. Jev) the proxy executed.
+    service_marker = "[proxy][service-call] "
     incoming_entries: list[str] = []
     outgoing_entries: list[str] = []
+    service_entries: list[str] = []
 
     candidate_logs = [
         sidecar_log_paths.get("compression-service_log", ""),
@@ -2043,11 +2073,17 @@ def _extract_message_request_logs(*, sidecar_log_paths: dict[str, str], destinat
         candidate_path = Path(raw_path)
         if not candidate_path.is_file():
             continue
-        for line in candidate_path.read_text(encoding="utf-8").splitlines():
+        for line in candidate_path.read_text(encoding="utf-8", errors="replace").split("\n"):
+            for prefix in ("[compression-service][", "[proxy]["):
+                if prefix in line:
+                    head, sep, rest = line.partition(prefix)
+                    line = head + sep + _DOCKER_SPLIT_TIMESTAMP.sub("", rest)
             if in_marker in line:
                 incoming_entries.append(line.split(in_marker, 1)[1].strip())
             if out_marker in line:
                 outgoing_entries.append(line.split(out_marker, 1)[1].strip())
+            if service_marker in line:
+                service_entries.append(line.split(service_marker, 1)[1].strip())
 
     extracted_paths: dict[str, str] = {}
     if incoming_entries:
@@ -2059,6 +2095,11 @@ def _extract_message_request_logs(*, sidecar_log_paths: dict[str, str], destinat
         outgoing_path = destination_dir / "messages-out.jsonl"
         outgoing_path.write_text("\n".join(outgoing_entries) + "\n", encoding="utf-8")
         extracted_paths["messages_out_path"] = str(outgoing_path)
+
+    if service_entries:
+        service_path = destination_dir / "service-calls.jsonl"
+        service_path.write_text("\n".join(service_entries) + "\n", encoding="utf-8")
+        extracted_paths["service_calls_path"] = str(service_path)
 
     return extracted_paths
 
@@ -2195,7 +2236,7 @@ def _extract_stream_error(stdout: str) -> str | None:
     """
     session_error: str | None = None
     call_failure: str | None = None
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
         line = line.strip()
         if not line:
             continue
@@ -2488,6 +2529,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     sidecar_log_paths: dict[str, str] = {}
     message_request_log_paths: dict[str, str] = {}
     proxy_token_usage: dict[str, int] = {}
+    proxy_service_usage: dict[str, Any] = {}
     patch_capture: dict[str, Any] = {
         "status": "not-captured",
         "repo_dir": "",
@@ -2832,6 +2874,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 destination_dir=tmp_run_dir,
             )
             proxy_token_usage = _extract_proxy_token_usage(sidecar_log_paths=sidecar_log_paths)
+            proxy_service_usage = _extract_proxy_service_usage(sidecar_log_paths=sidecar_log_paths)
         if isolation_rules:
             _remove_proxy_compression_isolation(isolation_rules)
         if stack_up_attempted and not keep_stack:
@@ -2917,6 +2960,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
         "patch_capture": patch_capture,
         "patch_evaluation": patch_evaluation,
         "token_usage": proxy_token_usage,
+        "service_usage": proxy_service_usage,
         **sidecar_log_paths,
         **message_request_log_paths,
         **log_paths,

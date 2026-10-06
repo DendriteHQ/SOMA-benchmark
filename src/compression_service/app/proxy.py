@@ -498,12 +498,12 @@ def _run_service_round(
             totals["cost"] = round(totals["cost"] + float(usage.get("cost") or 0.0), 10)
         else:
             entry["error"] = value
-        print(f"{SERVICE_CALL_LOG_MARKER}{json.dumps(entry, ensure_ascii=False)}", flush=True)
+        print(f"{SERVICE_CALL_LOG_MARKER}{json.dumps(entry)}", flush=True)
     if runnable:
         print(f"{SERVICE_USAGE_LOG_MARKER}{json.dumps(_service_totals)}", flush=True)
     for cid, result in results.items():
         if not result.get("ok") and cid not in dict(runnable):
-            print(f"{SERVICE_CALL_LOG_MARKER}{json.dumps({'request_id': request_id, 'session': pending.get('session'), 'round': pending.get('round'), 'id': cid, 'ok': False, 'error': result['error']}, ensure_ascii=False)}", flush=True)
+            print(f"{SERVICE_CALL_LOG_MARKER}{json.dumps({'request_id': request_id, 'session': pending.get('session'), 'round': pending.get('round'), 'id': cid, 'ok': False, 'error': result['error']})}", flush=True)
     return [results[c.get("id") if isinstance(c, dict) else None] for c in calls]
 
 

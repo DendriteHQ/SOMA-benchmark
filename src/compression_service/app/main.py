@@ -79,7 +79,7 @@ def _emit_message_event(*, request_id: str, stage: str, path: str, query: str, p
         "model": payload.get("model"),
         "messages": _extract_messages(payload),
     }
-    print(f"{marker} {json.dumps(entry, ensure_ascii=False)}", flush=True)
+    print(f"{marker} {json.dumps(entry)}", flush=True)
 
 
 _COMPRESSOR_EXEC_MARKER = "[compression-service][compressor.exec]"
@@ -110,7 +110,7 @@ def _emit_compressor_exec_event(entry: dict[str, Any]) -> None:
     These lines are picked out of the collected container log by the sandbox
     service and uploaded to S3 as the run's compressor execution log.
     """
-    print(f"{_COMPRESSOR_EXEC_MARKER} {json.dumps(entry, ensure_ascii=False)}", flush=True)
+    print(f"{_COMPRESSOR_EXEC_MARKER} {json.dumps(entry)}", flush=True)
 
 
 def _load_compressor_module() -> ModuleType | None:

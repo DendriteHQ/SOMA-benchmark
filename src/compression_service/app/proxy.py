@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import gzip
 import json
 import os
@@ -59,7 +58,7 @@ COMPRESSOR_SERVICES_PROTOCOL = "soma-compressor-services/1"
 JEV_OFFER: dict[str, Any] = {
     "ops": ["decide"],
     "default_model": "jev-latest",
-    "models": ["jev-latest", "jev-1.13", "typesafe/*", "~typesafe/*"],
+    "models": ["jev-latest", "jev-1.13"],
     "max_rounds": 50,
     "max_calls": 500,
     "max_calls_per_round": 16,
@@ -415,6 +414,10 @@ def _execute_jev_call(body: dict[str, Any], *, headers: dict[str, str], timeout:
         return False, {"code": "upstream_error", "message": f"invalid JSON: {exc}"}
     if not isinstance(parsed, dict) or not isinstance(parsed.get("answers"), dict):
         return False, {"code": "upstream_error", "message": "response has no answers"}
+    usage = parsed.get("usage")
+    input_tokens = usage.get("input_tokens") if isinstance(usage, dict) else None
+    if not (isinstance(input_tokens, int) and not isinstance(input_tokens, bool) and input_tokens > 0):
+        return False, {"code": "upstream_error", "message": "response has no usable usage"}
     return True, {k: parsed[k] for k in ("model", "answers", "usage") if k in parsed}
 
 
@@ -458,7 +461,7 @@ def _run_service_round(
             continue
         body = {"model": req.get("model") or offer["default_model"], "state": req.get("state"),
                 "questions": req.get("questions")}
-        if not isinstance(body["model"], str) or not any(fnmatch.fnmatchcase(body["model"], m) for m in offer["models"]):
+        if not isinstance(body["model"], str) or body["model"] not in offer["models"]:
             results[cid] = _service_error(cid, "invalid_request", f"model {body['model']!r} is not offered")
             continue
         if body["state"] is None or not isinstance(body["questions"], dict) or not body["questions"]:
@@ -498,12 +501,12 @@ def _run_service_round(
             totals["cost"] = round(totals["cost"] + float(usage.get("cost") or 0.0), 10)
         else:
             entry["error"] = value
-        print(f"{SERVICE_CALL_LOG_MARKER}{json.dumps(entry, ensure_ascii=False)}", flush=True)
+        print(f"{SERVICE_CALL_LOG_MARKER}{json.dumps(entry)}", flush=True)
     if runnable:
         print(f"{SERVICE_USAGE_LOG_MARKER}{json.dumps(_service_totals)}", flush=True)
     for cid, result in results.items():
         if not result.get("ok") and cid not in dict(runnable):
-            print(f"{SERVICE_CALL_LOG_MARKER}{json.dumps({'request_id': request_id, 'session': pending.get('session'), 'round': pending.get('round'), 'id': cid, 'ok': False, 'error': result['error']}, ensure_ascii=False)}", flush=True)
+            print(f"{SERVICE_CALL_LOG_MARKER}{json.dumps({'request_id': request_id, 'session': pending.get('session'), 'round': pending.get('round'), 'id': cid, 'ok': False, 'error': result['error']})}", flush=True)
     return [results[c.get("id") if isinstance(c, dict) else None] for c in calls]
 
 

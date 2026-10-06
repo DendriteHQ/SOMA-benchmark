@@ -1857,7 +1857,7 @@ def _count_trajectory_steps(trajectory_path: Path) -> int | None:
 
 def _extract_jsonl_lines(stdout: str) -> str:
     valid_lines: list[str] = []
-    for raw_line in stdout.splitlines():
+    for raw_line in stdout.split("\n"):
         line = raw_line.strip()
         if not line:
             continue
@@ -2014,7 +2014,7 @@ def _extract_proxy_token_usage(*, sidecar_log_paths: dict[str, str]) -> dict[str
     if not log_file.is_file():
         return {}
     last_usage: dict[str, int] = {}
-    for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in log_file.read_text(encoding="utf-8", errors="replace").split("\n"):
         idx = line.find(_PROXY_TOKEN_USAGE_MARKER)
         if idx == -1:
             continue
@@ -2041,7 +2041,7 @@ def _extract_proxy_service_usage(*, sidecar_log_paths: dict[str, str]) -> dict[s
         return {}
     marker = "[proxy][service-usage] "
     last: dict[str, Any] = {}
-    for line in Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in Path(log_path).read_text(encoding="utf-8", errors="replace").split("\n"):
         idx = line.find(marker)
         if idx == -1:
             continue
@@ -2073,7 +2073,7 @@ def _extract_message_request_logs(*, sidecar_log_paths: dict[str, str], destinat
         candidate_path = Path(raw_path)
         if not candidate_path.is_file():
             continue
-        for line in candidate_path.read_text(encoding="utf-8").splitlines():
+        for line in candidate_path.read_text(encoding="utf-8", errors="replace").split("\n"):
             for prefix in ("[compression-service][", "[proxy]["):
                 if prefix in line:
                     head, sep, rest = line.partition(prefix)
@@ -2236,7 +2236,7 @@ def _extract_stream_error(stdout: str) -> str | None:
     """
     session_error: str | None = None
     call_failure: str | None = None
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
         line = line.strip()
         if not line:
             continue

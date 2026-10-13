@@ -60,6 +60,11 @@ services:
   dind:
     image: ${COPILOT_DIND_IMAGE:-docker:dind}
     privileged: true
+    # Host backstop, set by the copilot backend from task_limits (0 / -1 = unlimited).
+    # Deliberately no mem_limit: a fallback `docker load` writes the whole task image into
+    # dind's tmpfs-backed data root, and that is charged to this container.
+    cpus: ${COPILOT_DIND_CPUS:-0}
+    pids_limit: ${COPILOT_DIND_PIDS_LIMIT:--1}
     environment:
       - DOCKER_TLS_CERTDIR=${COPILOT_DIND_TLS_CERTDIR-/certs}
     volumes:

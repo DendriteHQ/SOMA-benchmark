@@ -25,6 +25,7 @@ from ...progress import emit_progress
 from ...registry_auth import docker_env_for_image, uses_token_auth
 from ...soma_task_eval import maybe_run_soma_task_evaluation
 from ...soma_tasks import ROLE_ENV, is_soma_task, task_image_workdir
+from ...task_limits import TaskContainerLimits, resolve_task_container_limits
 from ...swebench_images import (
     default_soma_task_dind_repo,
     derive_prebaked_dind_image,
@@ -74,6 +75,13 @@ COPILOT_SANDBOX_GATEWAY_MODE_ISOLATED = "isolated"
 COPILOT_SANDBOX_GATEWAY_MODE_NAT = "nat"
 COPILOT_DEFAULT_SANDBOX_GATEWAY_MODE = COPILOT_SANDBOX_GATEWAY_MODE_ISOLATED
 COPILOT_DIND_WORKSPACE_MOUNT = "/workspace"
+# Written inside dind (on its own root fs) and bind-mounted over the nested sandbox's
+# /sys/devices/system/cpu/online - see task_limits.
+COPILOT_DIND_CPU_ONLINE_PATH = "/soma-task-cpu-online"
+# dind's own budget on top of the nested sandbox's: dockerd, containerd, shims, and the
+# `docker exec` processes the broker and this backend start.
+COPILOT_DIND_PIDS_HEADROOM = 1024
+COPILOT_DIND_CPUS_HEADROOM = 1
 COPILOT_SWE_EXEC_BROKER_SERVICE = "swe-exec-broker"
 COPILOT_DEFAULT_SWE_EXEC_BROKER = True
 COPILOT_DEFAULT_SWE_EXEC_BROKER_PORT = 8100
@@ -966,12 +974,28 @@ def _start_nested_swe_sandbox(
     container_name: str,
     workspace_container_path: str,
     repo_path: str,
+    limits: TaskContainerLimits | None,
 ) -> str:
     # Fresh dind per run, but guard against a leftover container from a crashed prior attempt.
     _run_command(["docker", "exec", dind_container_id, "docker", "rm", "-f", container_name])
+    limit_args: list[str] = []
+    if limits is not None:
+        # The agent runs the task's test suite in here; without these it sizes its worker
+        # pools from the whole host's CPU count (see task_limits).
+        written = _run_command([
+            "docker", "exec", dind_container_id,
+            "sh", "-c", f"printf %s {shlex.quote(limits.cpu_online())} > {COPILOT_DIND_CPU_ONLINE_PATH}",
+        ])
+        if written.returncode != 0:
+            raise RuntimeError(
+                "Failed to write the SWE sandbox's CPU list inside the isolated Docker daemon (dind). "
+                f"{(written.stderr or written.stdout or '').strip()}"
+            )
+        limit_args = limits.docker_run_args(cpu_online_file=COPILOT_DIND_CPU_ONLINE_PATH)
     run_result = _run_command([
         "docker", "exec", dind_container_id, "docker", "run", "-d",
         "--name", container_name,
+        *limit_args,
         "-v", f"{workspace_container_path}:{repo_path}",
         image,
         "sh", "-lc", "while true; do sleep 3600; done",
@@ -2447,6 +2471,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
     # non-broker runs would strand the agent at the default path while the prompt, the sandbox
     # mount and the broker all pointed at the image's real repo path.
     env["COPILOT_SWE_SANDBOX_REPO_PATH"] = swe_sandbox_repo_path
+    task_limits = resolve_task_container_limits(_resolve_runtime_options(context))
     if compose_swe_sandbox_enabled:
         if use_host_docker_socket:
             env["COPILOT_SWE_SANDBOX_IMAGE"] = swe_sandbox_image
@@ -2465,6 +2490,12 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
             # environment happens to hold would let an unrelated DOCKER_TLS_CERTDIR decide
             # whether the daemon is authenticated.
             env["COPILOT_DIND_TLS_CERTDIR"] = COPILOT_DIND_TLS_CERTDIR if dind_tls_enabled else ""
+            if task_limits is not None:
+                # A backstop for the host, not what keeps the tests small (that is the nested
+                # sandbox's own limits). Deliberately no memory cap: a fallback `docker load`
+                # writes the whole multi-GB task image into dind's tmpfs-backed data root.
+                env["COPILOT_DIND_CPUS"] = str(task_limits.cpus + COPILOT_DIND_CPUS_HEADROOM)
+                env["COPILOT_DIND_PIDS_LIMIT"] = str(task_limits.pids_limit + COPILOT_DIND_PIDS_HEADROOM)
             if not dind_tls_enabled:
                 # Reverts the daemon to a plaintext, unauthenticated listener. The iptables
                 # layer becomes the only remaining control, which is why
@@ -2655,6 +2686,7 @@ def run_copilot_instance(context: RuntimeExecutionContext) -> RuntimeExecutionRe
                 container_name=swe_sandbox_container_name,
                 workspace_container_path=COPILOT_DIND_WORKSPACE_MOUNT,
                 repo_path=swe_sandbox_repo_path,
+                limits=task_limits,
             )
 
             env["SWE_BENCH_SANDBOX_CONTAINER_ID"] = swe_sandbox_container_id

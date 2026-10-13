@@ -38,6 +38,7 @@ from .soma_tasks import (
     task_report_path,
     task_run_tests_command,
 )
+from .task_limits import resolve_task_container_limits
 
 DEFAULT_TEST_TIMEOUT_SECONDS = 1_800
 DEFAULT_EVAL_NETWORK = "none"
@@ -376,6 +377,7 @@ def maybe_run_soma_task_evaluation(
                 ),
             }
 
+    task_limits = resolve_task_container_limits(runtime_options)
     container_name = f"{CONTAINER_NAME_PREFIX}{_slug(instance_id, default='instance')}-{uuid.uuid4().hex[:8]}"
     container_patch_path = "/tmp/soma-agent.patch"
     report_path = output_dir / "report.json"
@@ -393,6 +395,7 @@ def maybe_run_soma_task_evaluation(
         "test_log_path": str(test_log_path),
         "fail_to_pass_total": len(fail_to_pass_ids),
         "pass_to_pass_total": len(pass_to_pass_ids),
+        "resource_limits": task_limits.as_dict() if task_limits is not None else None,
     }
     if not sanitized_patch_path.is_file() or sanitized_patch_path.stat().st_size == 0:
         return {
@@ -409,6 +412,14 @@ def maybe_run_soma_task_evaluation(
             },
         }
 
+    # Without these the task's tests size their worker pools from the whole host's CPU
+    # count (see task_limits).
+    limit_args: list[str] = []
+    if task_limits is not None:
+        cpu_online_path = output_dir / "cpu-online"
+        cpu_online_path.write_text(task_limits.cpu_online(), encoding="utf-8")
+        limit_args = task_limits.docker_run_args(cpu_online_file=str(cpu_online_path))
+
     # The graded container never needs the network (the image already has every dependency
     # installed) and must not be able to reach the run's LLM proxy, so it is started detached
     # on `none` and kept alive by a sleep while patch/test/report steps exec into it.
@@ -417,6 +428,7 @@ def maybe_run_soma_task_evaluation(
             "docker", "run", "-d",
             "--name", container_name,
             "--network", network,
+            *limit_args,
             "--entrypoint", "sh",
             test_image,
             "-lc", f"sleep {timeout + 120}",

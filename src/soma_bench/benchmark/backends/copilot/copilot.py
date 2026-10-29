@@ -843,12 +843,26 @@ def _resolve_swe_exec_timeout_seconds(context: RuntimeExecutionContext) -> int:
     )
 
 
+def _swe_exec_assets_dir() -> Path:
+    """Directory the SWE exec broker script and client are bind-mounted from.
+
+    Both are bind-mount sources, so they must exist on the Docker daemon's side. That
+    holds for the package directory only when this process runs on the host itself; a
+    caller running in a container (sandbox_service's runner) copies them to a
+    host-visible path and points SOMA_COPILOT_SWE_EXEC_ASSETS_DIR at it.
+    """
+    configured = (os.getenv("SOMA_COPILOT_SWE_EXEC_ASSETS_DIR") or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(__file__).resolve().parent / "copilot-cli-container"
+
+
 def _swe_exec_broker_script_path() -> Path:
-    return Path(__file__).resolve().parent / "copilot-cli-container" / "swe_exec_broker.py"
+    return _swe_exec_assets_dir() / "swe_exec_broker.py"
 
 
 def _swe_exec_client_path() -> Path:
-    return Path(__file__).resolve().parent / "copilot-cli-container" / "swe-exec"
+    return _swe_exec_assets_dir() / "swe-exec"
 
 
 def _resolve_use_host_docker_socket(context: RuntimeExecutionContext) -> bool:

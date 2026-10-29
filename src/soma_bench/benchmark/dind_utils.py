@@ -8,14 +8,19 @@ image into an isolated dind daemon using this exact code.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
 
 from .registry_auth import docker_env_for_image
 
-DIND_START_RETRIES = 60
+# A pre-baked dind image unpacks its whole docker storage (several GB) before dockerd
+# starts, so readiness is bounded by disk throughput, not by dockerd's own start time.
+DIND_READY_TIMEOUT_ENV = "SOMA_DIND_READY_TIMEOUT_SECONDS"
+DEFAULT_DIND_READY_TIMEOUT_SECONDS = 600.0
 DIND_START_SLEEP_SECONDS = 0.5
+DIND_FAILURE_LOG_TAIL_LINES = 20
 
 
 def run_command(
@@ -52,15 +57,49 @@ def ensure_docker_image_available(image_ref: str, *, role: str) -> None:
     )
 
 
+def dind_ready_timeout_seconds() -> float:
+    raw = (os.getenv(DIND_READY_TIMEOUT_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_DIND_READY_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_DIND_READY_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_DIND_READY_TIMEOUT_SECONDS
+
+
+def _dind_container_running(dind_container_id: str) -> bool:
+    probe = run_command(["docker", "inspect", "--format", "{{.State.Running}}", dind_container_id])
+    return probe.returncode == 0 and probe.stdout.strip() == "true"
+
+
+def _dind_log_tail(dind_container_id: str) -> str:
+    logs = run_command(["docker", "logs", "--tail", str(DIND_FAILURE_LOG_TAIL_LINES), dind_container_id])
+    # dockerd and the pre-bake entrypoint both log to stderr.
+    return "\n".join(part.strip() for part in (logs.stdout, logs.stderr) if part and part.strip())
+
+
 def wait_for_dind_ready(*, dind_container_id: str) -> None:
+    timeout_seconds = dind_ready_timeout_seconds()
+    deadline = time.monotonic() + timeout_seconds
     last_error = ""
-    for _ in range(DIND_START_RETRIES):
+    while True:
         probe = run_command(["docker", "exec", dind_container_id, "docker", "info"])
         if probe.returncode == 0:
             return
         last_error = (probe.stderr or probe.stdout or "").strip()
+        if not _dind_container_running(dind_container_id):
+            reason = "exited before its daemon became ready"
+            break
+        if time.monotonic() >= deadline:
+            reason = f"did not become ready within {timeout_seconds:g}s"
+            break
         time.sleep(DIND_START_SLEEP_SECONDS)
-    raise RuntimeError(f"Isolated Docker daemon (dind) did not become ready: {last_error}")
+    message = f"Isolated Docker daemon (dind) {reason}: {last_error}"
+    log_tail = _dind_log_tail(dind_container_id)
+    if log_tail:
+        message += f"\ndind container log (last {DIND_FAILURE_LOG_TAIL_LINES} lines):\n{log_tail}"
+    raise RuntimeError(message)
 
 
 def ensure_image_in_isolated_daemon(*, dind_container_id: str, image: str, role: str) -> None:

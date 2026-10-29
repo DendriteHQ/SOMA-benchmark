@@ -1,7 +1,8 @@
 services:
   copilot:
     build: .
-    image: local/copilot-cli:latest
+    # Overridable so a host can pin a versioned build instead of whatever was built last.
+    image: ${COPILOT_AGENT_IMAGE:-local/copilot-cli:latest}
     pull_policy: never
     env_file:
       - .env
@@ -70,6 +71,12 @@ services:
     volumes:
       - copilot-workspace:/workspace
       - copilot-dind-certs:/certs/client
+      # docker:dind declares VOLUME /var/lib/docker. Left anonymous, that volume (the
+      # task images, several GB on the host's tmpfs) carries no project label, so a
+      # teardown that fails to remove it leaves nothing to find it by. Named, it is
+      # labelled with the compose project and removed by `down --volumes`. Docker still
+      # populates it from the image on first mount, so pre-baked dind images keep working.
+      - copilot-dind-data:/var/lib/docker
     stop_grace_period: 60s
     profiles:
       - copilot-sidecars
@@ -137,6 +144,7 @@ volumes:
   # Compose-managed (not external), so `down --volumes` removes it with the stack and the
   # dind client certificate never outlives the run it was generated for.
   copilot-dind-certs:
+  copilot-dind-data:
   copilot-workspace:
     external: true
     name: ${COPILOT_WORKSPACE_VOLUME_NAME}

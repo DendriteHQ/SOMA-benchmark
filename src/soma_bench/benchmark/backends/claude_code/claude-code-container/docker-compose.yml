@@ -1,0 +1,176 @@
+# Stack for the `claude_code` runtime backend.
+#
+# The copilot stack next door with a different agent service: the backend runs on
+# harness_base.run_harness_instance, which addresses the sidecars, networks and volumes below by name
+# (several as `{project}-{service}-1` / `{project}_{network}`) and sets the COPILOT_*
+# variables they interpolate. Keep everything except the `claude-code` service, its home
+# volume and the proxy's PROXY_OPENAI_* lines identical to
+# ../../copilot/copilot-cli-container/docker-compose.yml.
+services:
+  claude-code:
+    build: .
+    # Overridable so a host can pin a versioned build instead of whatever was built last.
+    image: ${CLAUDE_CODE_AGENT_IMAGE:-local/claude-code-agent:latest}
+    pull_policy: never
+    # No env_file on purpose: every variable this service reads (ANTHROPIC_BASE_URL,
+    # ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL, CLAUDE_CODE_*) is injected per run by
+    # claude_code.py with `docker compose run -e`, so there is no gitignored dotfile to
+    # create before the stack will come up.
+    working_dir: ${COPILOT_SWE_SANDBOX_REPO_PATH:-/testbed}
+    volumes:
+      - copilot-workspace:${COPILOT_SWE_SANDBOX_REPO_PATH:-/testbed}
+      - claude-code-home:/home/claude
+    networks:
+      - copilot-sandbox
+    # Deliberately no extra_hosts: the agent has no business addressing the host. See the
+    # gateway_mode_ipv4 note on copilot-sandbox below - `internal: true` alone does not stop
+    # it from reaching host services on the bridge gateway.
+    stdin_open: true
+    tty: true
+
+  proxy:
+    image: ${COPILOT_PROXY_IMAGE:-soma-compression-service:latest}
+    environment:
+      - PROXY_UPSTREAM_BASE_URL=${COMPACT_BENCH_LLM_BASE_URL}
+      - PROXY_COMPRESSION_BASE_URL=${PROXY_COMPRESSION_BASE_URL:-http://compression-service:8000/}
+      - PROXY_COMPRESSION_BASE_URL_TEMPLATE=${PROXY_COMPRESSION_BASE_URL_TEMPLATE:-}
+      - PROXY_COMPRESSION_ROUTE_MAP=${PROXY_COMPRESSION_ROUTE_MAP:-}
+      - PROXY_COMPRESSION_ENABLED=${PROXY_COMPRESSION_ENABLED:-true}
+      - PROXY_PROVIDER_API_KEY=${PROXY_PROVIDER_API_KEY:-}
+      - PROXY_RUN_ID_HEADER_VALUE=${PROXY_RUN_ID_HEADER_VALUE:-}
+      # Anthropic Messages -> OpenAI chat translation; set per run by claude_code.py.
+      - PROXY_OPENAI_TRANSLATION=${PROXY_OPENAI_TRANSLATION:-0}
+      - PROXY_OPENAI_CARRY_REASONING=${PROXY_OPENAI_CARRY_REASONING:-1}
+      - PROXY_OPENAI_SORT_TOOLS=${PROXY_OPENAI_SORT_TOOLS:-1}
+      - PROXY_OPENAI_REASONING_EFFORT=${PROXY_OPENAI_REASONING_EFFORT:-}
+      - PORT=${COPILOT_PROXY_PORT:-8080}
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - uvicorn
+      - app.proxy:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - ${COPILOT_PROXY_PORT:-8080}
+    networks:
+      - copilot-sandbox
+      - copilot-egress
+
+  compression-service:
+    image: ${COPILOT_COMPRESSION_SERVICE_IMAGE:-soma-compression-service:latest}
+    environment:
+      - MINER_MODULE_PATH=/app/miner/base_miner.py
+      - COMPRESSION_MUTATE_REQUEST=${COMPRESSION_MUTATE_REQUEST:-true}
+    volumes:
+      - ${COPILOT_COMPRESSION_SCRIPT_PATH:-/dev/null}:/app/miner/base_miner.py:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    profiles:
+      - copilot-sidecars
+    networks:
+      - copilot-sandbox
+
+  dind:
+    image: ${COPILOT_DIND_IMAGE:-docker:dind}
+    privileged: true
+    # Host backstop, set by the copilot backend from task_limits (0 / -1 = unlimited).
+    # Deliberately no mem_limit: a fallback `docker load` writes the whole task image into
+    # dind's tmpfs-backed data root, and that is charged to this container.
+    cpus: ${COPILOT_DIND_CPUS:-0}
+    pids_limit: ${COPILOT_DIND_PIDS_LIMIT:--1}
+    environment:
+      - DOCKER_TLS_CERTDIR=${COPILOT_DIND_TLS_CERTDIR-/certs}
+    volumes:
+      - copilot-workspace:/workspace
+      - copilot-dind-certs:/certs/client
+      # docker:dind declares VOLUME /var/lib/docker. Left anonymous, that volume (the
+      # task images, several GB on the host's tmpfs) carries no project label, so a
+      # teardown that fails to remove it leaves nothing to find it by. Named, it is
+      # labelled with the compose project and removed by `down --volumes`. Docker still
+      # populates it from the image on first mount, so pre-baked dind images keep working.
+      - copilot-dind-data:/var/lib/docker
+    stop_grace_period: 60s
+    profiles:
+      - copilot-sidecars
+    networks:
+      copilot-dind:
+        aliases:
+          - docker
+
+  swe-exec-broker:
+    image: ${COPILOT_SWE_EXEC_BROKER_IMAGE:-soma-compression-service:latest}
+    entrypoint:
+      - python
+      - /app/swe_exec_broker.py
+    environment:
+      - SWE_EXEC_BROKER_TOKEN=${COPILOT_SWE_EXEC_BROKER_TOKEN:-}
+      - SWE_EXEC_BROKER_PORT=${COPILOT_SWE_EXEC_BROKER_PORT:-8100}
+      - SWE_EXEC_SANDBOX_CONTAINER=${COPILOT_SWE_EXEC_SANDBOX_CONTAINER:-}
+      - SWE_EXEC_SANDBOX_REPO_PATH=${COPILOT_SWE_SANDBOX_REPO_PATH:-/testbed}
+      - SWE_EXEC_SANDBOX_ENV_BIN_DIR=${COPILOT_SWE_EXEC_SANDBOX_ENV_BIN_DIR:-}
+      - SWE_EXEC_DIND_HOST=${COPILOT_DIND_HOSTNAME:-docker}
+      - SWE_EXEC_DIND_PORT=${COPILOT_DIND_PORT:-2376}
+      - SWE_EXEC_TIMEOUT_SECONDS=${COPILOT_SWE_EXEC_TIMEOUT_SECONDS:-900}
+    volumes:
+      - ${COPILOT_SWE_EXEC_BROKER_SCRIPT_PATH:-/dev/null}:/app/swe_exec_broker.py:ro
+      - copilot-dind-certs:/certs/client:ro
+    # Overrides the base image's healthcheck, which probes the compression service's
+    # /health on $PORT - an endpoint and a port this container does not have, so it would
+    # sit permanently unhealthy and mask a genuine failure.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${COPILOT_SWE_EXEC_BROKER_PORT:-8100}/healthz', timeout=2)" || exit 1
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 6
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    profiles:
+      - copilot-sidecars
+    networks:
+      - copilot-sandbox
+      - copilot-dind
+
+  # Legacy bridge: only started when SOMA_COPILOT_USE_HOST_DOCKER_SOCKET is set.
+  # Runs directly on the host engine, reachable via the host docker.sock mounted
+  # into the agent container - no isolation from other host containers.
+  swe-sandbox:
+    image: ${COPILOT_SWE_SANDBOX_IMAGE:-alpine:3.20}
+    volumes:
+      - copilot-workspace:${COPILOT_SWE_SANDBOX_REPO_PATH:-/testbed}
+    command:
+      - /bin/sh
+      - -lc
+      - while true; do sleep 3600; done
+    profiles:
+      - copilot-sidecars
+    networks:
+      - copilot-sandbox
+
+volumes:
+  claude-code-home:
+  # Compose-managed (not external), so `down --volumes` removes it with the stack and the
+  # dind client certificate never outlives the run it was generated for.
+  copilot-dind-certs:
+  copilot-dind-data:
+  copilot-workspace:
+    external: true
+    name: ${COPILOT_WORKSPACE_VOLUME_NAME}
+
+networks:
+  copilot-sandbox:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: ${COPILOT_SANDBOX_GATEWAY_MODE:-isolated}
+  copilot-dind:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: ${COPILOT_SANDBOX_GATEWAY_MODE:-isolated}
+  copilot-egress:

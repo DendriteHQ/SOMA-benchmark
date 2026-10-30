@@ -41,6 +41,9 @@ def _build_runtime_options(
     copilot_compression_service_autobuild: bool,
     copilot_compression_service_build_context: str | None,
     copilot_use_host_docker_socket: bool = False,
+    claude_code_permission_mode: str | None = None,
+    claude_code_max_turns: int | None = None,
+    claude_code_disallowed_tools: str | None = None,
 ) -> dict[str, Any]:
     runtime_options: dict[str, Any] = {}
     if openclaw_command:
@@ -87,6 +90,15 @@ def _build_runtime_options(
         )
     if copilot_use_host_docker_socket:
         runtime_options["copilot_use_host_docker_socket"] = True
+
+    if claude_code_permission_mode:
+        runtime_options["claude_code_permission_mode"] = claude_code_permission_mode
+    if claude_code_max_turns is not None:
+        runtime_options["claude_code_max_turns"] = claude_code_max_turns
+    # Not `if ...:` - an empty string is the documented way to clear the backend's own
+    # default deny list, and is distinct from the flag being absent.
+    if claude_code_disallowed_tools is not None:
+        runtime_options["claude_code_disallowed_tools"] = claude_code_disallowed_tools
     return runtime_options
 
 
@@ -243,6 +255,29 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--claude-code-permission-mode",
+        default=None,
+        help=(
+            "Claude Code permission mode (default bypassPermissions - a benchmark run has "
+            "nobody to answer a prompt)."
+        ),
+    )
+    parser.add_argument(
+        "--claude-code-max-turns",
+        type=int,
+        default=None,
+        help="Turn ceiling for Claude Code. Unlimited by default, like Copilot.",
+    )
+    parser.add_argument(
+        "--claude-code-disallowed-tools",
+        default=None,
+        help=(
+            "Comma-separated tools to deny Claude Code, replacing the backend's default "
+            "deny list (Workflow, Cron*, and other session-management tools). Pass an "
+            "empty string to allow all of them."
+        ),
+    )
+    parser.add_argument(
         "--copilot-use-host-docker-socket",
         action="store_true",
         help=(
@@ -327,6 +362,9 @@ def main(argv: list[str] | None = None) -> int:
         copilot_compression_service_autobuild=args.copilot_compression_service_autobuild,
         copilot_compression_service_build_context=args.copilot_compression_service_build_context,
         copilot_use_host_docker_socket=args.copilot_use_host_docker_socket,
+        claude_code_permission_mode=args.claude_code_permission_mode,
+        claude_code_max_turns=args.claude_code_max_turns,
+        claude_code_disallowed_tools=args.claude_code_disallowed_tools,
     )
     run_plan = build_run_plan(
         instances,

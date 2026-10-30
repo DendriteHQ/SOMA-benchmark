@@ -5,7 +5,7 @@ instance's SWE-bench sandbox image into it (reusing the exact same code path the
 runtime backend uses as its save/load fallback - see dind_utils.py), commits the stopped
 container to a new image, verifies it from a fresh container, and pushes it to a Docker
 Hub repo. The benchmark RUNTIME never builds anything - it only ever pulls a pre-baked
-tag if one exists (backends/copilot/copilot.py's `_resolve_effective_dind_image`), and
+tag if one exists (backends/harness_base.py's `_resolve_effective_dind_image`), and
 falls back to today's on-demand save/load otherwise.
 
 Safely re-runnable: Docker Hub itself is the source of truth for "already built" (via

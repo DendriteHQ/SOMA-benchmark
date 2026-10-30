@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from .claude_code import CLAUDE_CODE_BACKEND
 from .copilot import COPILOT_BACKEND
 from .openclaw import OPENCLAW_BACKEND
 from .base import RuntimeBackend
 
 REGISTERED_BACKENDS: dict[str, RuntimeBackend] = {
+    CLAUDE_CODE_BACKEND.name: CLAUDE_CODE_BACKEND,
     COPILOT_BACKEND.name: COPILOT_BACKEND,
     OPENCLAW_BACKEND.name: OPENCLAW_BACKEND,
 }

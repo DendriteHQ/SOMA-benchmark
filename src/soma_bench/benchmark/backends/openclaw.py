@@ -57,6 +57,7 @@ OPENCLAW_WS_WATCHDOG_MAX_BACKOFF_SECONDS = 10.0
 OPENCLAW_HEARTBEAT_DISABLED_INTERVAL = "0m"
 OPENCLAW_PROVIDER_TIMEOUT_SECONDS_ENV = "SOMA_OPENCLAW_PROVIDER_TIMEOUT_SECONDS"
 OPENCLAW_DEFAULT_PROVIDER_TIMEOUT_SECONDS = 240
+HARNESS_AGENT_TIMEOUT_SECONDS_ENV = "SOMA_HARNESS_AGENT_TIMEOUT_SECONDS"
 OPENCLAW_GATEWAY_PIDS_LIMIT = 4096
 OPENCLAW_GATEWAY_ULIMIT_NOFILE = "4096"
 COMPRESSION_SERVICE_IMAGE_NAME = "soma-compression-service:latest"
@@ -106,8 +107,16 @@ def _run_command(
     args: list[str],
     *,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, capture_output=True, check=False, env=env)
+    return subprocess.run(
+        args,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+        timeout=timeout,
+    )
 
 
 def _host_docker_binary() -> str | None:
@@ -178,6 +187,24 @@ def _coerce_positive_int(raw_value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
+
+
+def _resolve_agent_timeout_seconds(context: RuntimeExecutionContext) -> float | None:
+    """Resolve the wall-clock limit shared by every runtime harness."""
+    for raw_value in (
+        os.getenv(HARNESS_AGENT_TIMEOUT_SECONDS_ENV),
+        _resolve_runtime_option(context, "harness_agent_timeout_seconds"),
+        _resolve_runtime_option(context, "openclaw_agent_timeout_seconds"),
+    ):
+        if raw_value is None:
+            continue
+        try:
+            value = float(str(raw_value).strip())
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
 
 
 def _coerce_float_range(raw_value: Any, default: float, *, minimum: float, maximum: float) -> float:
@@ -3182,8 +3209,15 @@ def _run_openclaw_cli(
     *,
     gateway_name: str,
     cli_args: list[str],
-) -> subprocess.CompletedProcess[str]:
-    return _run_command(_cli_base_args(context, gateway_name=gateway_name) + cli_args)
+    timeout_seconds: float | None,
+) -> tuple[subprocess.CompletedProcess[str], bool]:
+    command = _cli_base_args(context, gateway_name=gateway_name) + cli_args
+    try:
+        return _run_command(command, timeout=timeout_seconds), False
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode(errors="replace")
+        stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode(errors="replace")
+        return subprocess.CompletedProcess(command, 124, stdout, stderr), True
 
 
 def _start_gateway_container(
@@ -3291,7 +3325,12 @@ def _wait_for_gateway_ready(context: RuntimeExecutionContext, *, gateway_name: s
                 "OpenClaw gateway container exited before becoming ready: "
                 f"{(inspect_result.stderr or inspect_result.stdout or '').strip()}"
             )
-        probe = _run_openclaw_cli(context, gateway_name=gateway_name, cli_args=["health", "--json"])
+        probe, _ = _run_openclaw_cli(
+            context,
+            gateway_name=gateway_name,
+            cli_args=["health", "--json"],
+            timeout_seconds=None,
+        )
         if probe.returncode == 0:
             return
         last_error = (probe.stderr or probe.stdout or "").strip()
@@ -3307,7 +3346,12 @@ def _wait_for_agent_registered(
 ) -> None:
     last_error = ""
     for _ in range(OPENCLAW_GATEWAY_START_RETRIES):
-        result = _run_openclaw_cli(context, gateway_name=gateway_name, cli_args=["agents", "list", "--json"])
+        result, _ = _run_openclaw_cli(
+            context,
+            gateway_name=gateway_name,
+            cli_args=["agents", "list", "--json"],
+            timeout_seconds=None,
+        )
         if result.returncode == 0:
             try:
                 payload = json.loads(result.stdout or "{}")
@@ -3444,6 +3488,7 @@ def _run_openclaw_agent_request(
         _artifacts_dir(context).mkdir(parents=True, exist_ok=True)
         max_ws_retries = _resolve_ws_watchdog_retries(context)
         ws_retry_backoff_seconds = _resolve_ws_watchdog_backoff_seconds(context)
+        agent_timeout_seconds = _resolve_agent_timeout_seconds(context)
         retry_error_summaries: list[str] = []
         result: subprocess.CompletedProcess[str] | None = None
         final_session_id: str | None = None
@@ -3493,8 +3538,20 @@ def _run_openclaw_agent_request(
                 f"[{context.instance.instance_id}] running openclaw agent session {current_session_id}",
                 component="openclaw",
             )
-            attempt_result = _run_openclaw_cli(context, gateway_name=gateway_name, cli_args=cli_args)
+            attempt_result, agent_timed_out = _run_openclaw_cli(
+                context,
+                gateway_name=gateway_name,
+                cli_args=cli_args,
+                timeout_seconds=agent_timeout_seconds,
+            )
             final_attempt_finished_at = time.time()
+
+            if agent_timed_out:
+                emit_progress(
+                    f"[{context.instance.instance_id}] OpenClaw execution timed out after "
+                    f"{agent_timeout_seconds:.0f}s",
+                    component="openclaw",
+                )
 
             (run_dir / f"stdout.attempt{attempt_index + 1}.log").write_text(
                 attempt_result.stdout or "",
@@ -3596,6 +3653,8 @@ def _run_openclaw_agent_request(
             "stdout_log": str(stdout_path),
             "stderr_log": str(stderr_path),
             "exit_code": result.returncode,
+            "agent_timeout_seconds": agent_timeout_seconds,
+            "agent_timed_out": agent_timed_out,
             "runtime_options": _resolve_runtime_options(context),
             "ws_close_code": ws_close_code,
             "ws_close_reason": ws_close_reason,
@@ -3671,6 +3730,16 @@ def _run_openclaw_agent_request(
                 instance_id=context.instance.instance_id,
                 backend_name=context.backend_name,
                 status="completed",
+                metadata=metadata,
+            )
+
+        if agent_timed_out:
+            return RuntimeExecutionResult(
+                benchmark_id=context.instance.benchmark_id,
+                instance_id=context.instance.instance_id,
+                backend_name=context.backend_name,
+                status="timeout",
+                error=f"OpenClaw execution timed out after {agent_timeout_seconds:.0f} seconds",
                 metadata=metadata,
             )
 

@@ -2,6 +2,9 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 pydantic>=2.7.0
+# Transitive via starlette, but proxy.py imports it directly to relay SSE bodies
+# off the event loop, so it is pinned here rather than left to chance.
+anyio>=4.0.0
 
 # Miner plugin dependencies
 nltk>=3.8

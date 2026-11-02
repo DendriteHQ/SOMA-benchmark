@@ -331,6 +331,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--claude-code-permission-mode",
+        default=None,
+        help=(
+            "Claude Code permission mode (default bypassPermissions - a benchmark run has "
+            "nobody to answer a prompt)."
+        ),
+    )
+    parser.add_argument(
+        "--claude-code-max-turns",
+        type=int,
+        default=None,
+        help="Turn ceiling for Claude Code. Unlimited by default, like Copilot.",
+    )
+    parser.add_argument(
+        "--claude-code-disallowed-tools",
+        default=None,
+        help=(
+            "Comma-separated tools to deny Claude Code, replacing the backend's default "
+            "deny list (Workflow, Cron*, and other session-management tools). Pass an "
+            "empty string to allow all of them."
+        ),
+    )
+    parser.add_argument(
         "--copilot-use-host-docker-socket",
         action="store_true",
         help=(
@@ -465,6 +488,9 @@ def main(argv: list[str] | None = None) -> int:
         copilot_compression_service_autobuild=args.copilot_compression_service_autobuild,
         copilot_compression_service_build_context=args.copilot_compression_service_build_context,
         copilot_use_host_docker_socket=args.copilot_use_host_docker_socket,
+        claude_code_permission_mode=args.claude_code_permission_mode,
+        claude_code_max_turns=args.claude_code_max_turns,
+        claude_code_disallowed_tools=args.claude_code_disallowed_tools,
     )
 
     if args.benchmark_type in (BENCHMARK_TYPE_SWE_EXPLORER_EDIT, BENCHMARK_TYPE_SWE_EXPLORER_EXPLORE):

@@ -1,6 +1,6 @@
 """Shared Docker-in-Docker (dind) helpers.
 
-Used by both the Copilot runtime backend (backends/copilot/copilot.py) and the offline
+Used by both the agent sandbox stack (backends/harness_base.py) and the offline
 swebench_dind_prebake build tool, so a pre-baked image and the runtime's save/load
 fallback are guaranteed to produce byte-identical results - both paths load a target
 image into an isolated dind daemon using this exact code.

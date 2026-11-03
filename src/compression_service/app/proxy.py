@@ -158,7 +158,7 @@ async def _accumulate_token_usage(usage: dict) -> None:
         raw_prompt = usage.get("prompt_tokens") or 0
         cache_read = prompt_details.get("cached_tokens") or 0
         cache_write = prompt_details.get("cache_write_tokens") or 0
-        raw_input = raw_prompt - cache_read  # non-cached portion only
+        raw_input = raw_prompt - cache_read - cache_write  # non-cached portion only
 
     async with _token_lock:
         _token_totals["input_tokens"] += max(raw_input, 0)
@@ -197,14 +197,13 @@ def _sse_usage_fields(payload: dict) -> dict[str, int] | None:
     if not isinstance(prompt_details, dict):
         prompt_details = {}
     cache_read = int(prompt_details.get("cached_tokens") or usage.get("cached_tokens") or 0)
+    cache_write = int(prompt_details.get("cache_write_tokens") or 0)
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
     return {
-        # Normalized to Anthropic semantics (non-cached input only) so the totals stay
-        # additive whichever shape the upstream speaks.
-        "input_tokens": max(prompt_tokens - cache_read, 0),
+        "input_tokens": max(prompt_tokens - cache_read - cache_write, 0),
         "output_tokens": int(usage.get("completion_tokens") or 0),
         "cache_read_input_tokens": cache_read,
-        "cache_creation_input_tokens": int(prompt_details.get("cache_write_tokens") or 0),
+        "cache_creation_input_tokens": cache_write,
     }
 
 
@@ -991,13 +990,13 @@ def _group_same_role(messages: list) -> list[dict]:
     return grouped
 
 
-def _anthropic_request_to_openai(payload: dict) -> dict:
-    """An Anthropic Messages body as an OpenAI `chat/completions` body.
+def _is_anthropic_model(model: Any) -> bool:
+    """Whether an OpenRouter model id names a Claude model (`anthropic/…`, `~anthropic/…`)."""
+    return isinstance(model, str) and model.lstrip("~").startswith("anthropic/")
 
-    `cache_control` markers are not carried over: they are Anthropic's explicit-write
-    cache protocol, and every OpenAI-shaped backend we target caches automatically by
-    prefix instead. Dropping them is the point of the exercise, not a loss.
-    """
+
+def _anthropic_request_to_openai(payload: dict) -> dict:
+    """An Anthropic Messages body as an OpenAI `chat/completions` body."""
     messages: list[dict] = []
 
     system = payload.get("system")
@@ -1032,6 +1031,8 @@ def _anthropic_request_to_openai(payload: dict) -> dict:
                 messages.append({"role": "user", "content": text})
 
     out: dict[str, Any] = {"model": payload.get("model"), "messages": messages}
+    if _is_anthropic_model(out["model"]):
+        out["cache_control"] = {"type": "ephemeral"}
     for src, dst in (("max_tokens", "max_tokens"), ("temperature", "temperature"),
                      ("top_p", "top_p"), ("stream", "stream")):
         if payload.get(src) is not None:

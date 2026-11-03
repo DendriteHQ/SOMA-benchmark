@@ -1,6 +1,6 @@
 # SOMA Bench
 
-SOMA Bench runs SWE-bench style tasks through runtime backends (OpenClaw and Copilot) and records runtime artifacts, patch output, token usage, and optional SWE-bench evaluation results.
+SOMA Bench runs SWE-bench style tasks through runtime backends (OpenClaw, Copilot and Claude Code) and records runtime artifacts, patch output, token usage, and optional SWE-bench evaluation results.
 
 The OpenClaw backend can load the SOMA OpenClaw plugin as a context-engine plugin, so benchmark runs can exercise the local SOMA miner during normal OpenClaw execution.
 
@@ -277,3 +277,89 @@ Per instance, under `--output-dir`:
 - `evaluation-summary.json` (only with `--swerebench-eval`) — `patch_capture.rows_with_changes`
   tells you whether Copilot actually produced a diff before you look at resolution rate; a run
   can finish with `status: completed` and still have made zero code changes.
+
+## Run Claude Code
+
+The Claude Code backend runs Anthropic's `claude` CLI through the [Claude Agent SDK for
+Python](https://github.com/anthropics/claude-agent-sdk-python) on the Copilot backend's
+sandbox stack: the same run (`run_harness_instance` in `backends/harness_base.py`) with a `claude-code`
+service in place of the `copilot` one. Checkout, workspace seeding, the isolated `dind` daemon
+and task sandbox, the `swe-exec` broker, the `proxy` and `compression-service` sidecars, patch
+capture and evaluation are all shared, and configured by the same `SOMA_COPILOT_*` env vars /
+`copilot_*` runtime options listed above (network isolation, SWE sandbox, keep stack, run id,
+compression script, ...). Only the agent itself is configured separately, below.
+
+The SDK is a library rather than a command, so the container's entrypoint is
+`claude-code-container/agent_runner.py`, which turns a prompt into a JSONL trajectory on stdout.
+
+### Build the images
+
+```bash
+cd src/soma_bench/benchmark/backends/claude_code/claude-code-container
+docker compose build claude-code      # builds local/claude-code-agent:latest
+# the proxy/compression sidecars are the same service the Copilot stack runs, so if you
+# already built it for Copilot there is nothing to do here:
+docker build -t soma-copilot-compression-service:latest ../../../../../compression_service
+```
+
+### Run it
+
+```bash
+uv run python -m soma_bench benchmark-solve \
+  --agent-name claude_code \
+  --benchmark princeton-nlp/SWE-bench_Verified \
+  --instance-id <instance_id> \
+  --execute \
+  --output-dir outputs/run-claude-code
+```
+
+### Pointing it at your provider
+
+Claude Code speaks the **Anthropic Messages API**: it posts to `/v1/messages`, appending that
+path to the base URL itself. Two consequences for `LLM_BASE_URL`:
+
+- The backend hands the proxy the upstream with one trailing `/v1` removed, so an
+  `LLM_BASE_URL` written for the OpenAI-shaped backends (`https://openrouter.ai/api/v1`) reaches
+  the provider's Anthropic endpoint at `https://openrouter.ai/api/v1/messages`. Set
+  `SOMA_CLAUDE_CODE_UPSTREAM_BASE_URL` when the provider's Anthropic-format endpoint does not
+  sit at the root of its OpenAI-format one.
+- **The upstream must actually serve an Anthropic-format endpoint.** OpenRouter does (its
+  "Anthropic skin"); a plain OpenAI-compatible endpoint does not, and returns 404. Any model the
+  provider serves works — the model id goes through as `ANTHROPIC_MODEL`.
+
+The credential travels as `ANTHROPIC_AUTH_TOKEN`, which Claude Code sends as
+`Authorization: Bearer` — the header the proxy and the sticky router already read. Streaming is
+not optional for Claude Code, and it aborts a response that goes silent for 300s, so the proxy
+relays `text/event-stream` bodies chunk by chunk instead of buffering them, tallying token usage
+off the events as they pass.
+
+### Useful `SOMA_CLAUDE_CODE_*` overrides
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `SOMA_CLAUDE_CODE_COMPOSE_FILE` | `claude-code-container/docker-compose.yml` | Alternate Compose file. Its sidecars, networks and volumes must match the Copilot one's. |
+| `SOMA_CLAUDE_CODE_SERVICE` | `claude-code` | Compose service name for the agent container |
+| `SOMA_CLAUDE_CODE_UPSTREAM_BASE_URL` | derived from `llm.base_url` | Anthropic-format upstream the proxy forwards to |
+| `SOMA_CLAUDE_CODE_PERMISSION_MODE` (`--claude-code-permission-mode`) | `bypassPermissions` | A benchmark run has nobody to answer a permission prompt |
+| `SOMA_CLAUDE_CODE_MAX_TURNS` (`--claude-code-max-turns`) | unlimited | Turn ceiling handed to the SDK. Unset, the agent runs until it finishes or `SOMA_HARNESS_AGENT_TIMEOUT_SECONDS` fires, as Copilot does - `--max-iterations` is not used by either harness. |
+| `SOMA_CLAUDE_CODE_DISALLOWED_TOOLS` (`--claude-code-disallowed-tools`) | `Workflow`, `Cron*`, and other session-management tools | Replaces the deny list. `Workflow` in particular can fan out agents that all bill through the same proxy, so the instance's token total would stop describing the trajectory it is scored on. `WebSearch`/`WebFetch` are denied on top of this whenever the run is network-isolated. Pass an empty string to allow everything. |
+| `PROXY_OPENAI_TRANSLATION` | `1` unless the model is Anthropic's | Have the proxy translate Claude Code's Anthropic Messages requests to OpenAI chat completions upstream (and the responses back) |
+
+`SOMA_HARNESS_AGENT_TIMEOUT_SECONDS` (runtime option `harness_agent_timeout_seconds`) is a
+wall-clock ceiling shared by every harness - Copilot, Claude Code and OpenClaw; the run is
+reported as `timeout` and patch capture is skipped. It takes precedence over
+`SOMA_COPILOT_AGENT_TIMEOUT_SECONDS`.
+
+### Output layout
+
+- `instances/<instance_id>/claude-code/{command.txt,prompt.txt,stdout.log,stderr.log}`
+- `claude-code-trajectory-<instance_id>.jsonl` — one JSON object per SDK message, each tagged
+  with the class it came from (`AssistantMessage`, `ResultMessage`, ...) and `runner.*` lines for
+  the container entrypoint's own lifecycle
+- `metadata.token_usage` is what the proxy counted crossing the compression boundary — the number
+  the benchmark scores. `metadata.sdk_token_usage` is what the agent itself reported; when the two
+  disagree, that difference is the finding.
+
+The run's exit status distinguishes an agent failure from a harness failure: exit 1 means Claude
+Code ran and ended in an error result (an API failure, a turn-limit stop), exit 2 means the
+container could not run it at all.

@@ -13,7 +13,7 @@ from .config import default_output_path
 from .execution import execute_runtime_contexts
 from .manifest import load_manifest, write_jsonl
 from .progress import emit_progress
-from .run_infer import _build_runtime_options, build_run_plan
+from .run_infer import add_harness_arguments, build_run_plan, build_runtime_options
 from .runner_settings import resolve_benchmark_concurrency, resolve_benchmark_runtime_setup, resolve_runner_config
 from .swebench_images import enrich_hidden_eval_with_runtime_image
 
@@ -235,7 +235,7 @@ def build_direct_manifest_row(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m soma_bench.benchmark.solve")
-    parser.add_argument("--agent-name", required=True, help="Runtime backend name, for example 'openclaw'.")
+    parser.add_argument("--agent-name", required=True, help="Runtime backend name, for example 'copilot' or 'claude_code'.")
     parser.add_argument(
         "--model",
         default=None,
@@ -263,107 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum number of benchmark instances to execute concurrently. Defaults to SOMA_BENCHMARK_CONCURRENCY or 1.",
     )
-    parser.add_argument(
-        "--openclaw-command",
-        default=None,
-        help="Optional extra arguments appended to `openclaw agent` inside the OpenClaw CLI sidecar.",
-    )
-    parser.add_argument(
-        "--openclaw-container-image",
-        default=None,
-        help="Optional Docker image override for the shared OpenClaw gateway and CLI sidecars.",
-    )
-    parser.add_argument(
-        "--openclaw-current-user",
-        action="store_true",
-        help=(
-            "Run OpenClaw gateway and CLI containers as the invoking host uid:gid. "
-            "Required unless provided via SOMA_OPENCLAW_USER or SOMA_OPENCLAW_CONTAINER_USER."
-        ),
-    )
-    parser.add_argument(
-        "--openclaw-run-id-header-value",
-        default=None,
-        help="Optional value sent as X-Run-Id on OpenClaw upstream model calls.",
-    )
-    parser.add_argument(
-        "--openclaw-ignore-api-key",
-        action="store_true",
-        help="Skip local LLM API key validation and do not forward API key credentials to OpenClaw. Use when the upstream gateway resolves auth from X-Run-Id.",
-    )
-    parser.add_argument(
-        "--openclaw-plugin-path",
-        default=None,
-        help="Optional local path to the SOMA OpenClaw plugin repository.",
-    )
-    parser.add_argument(
-        "--openclaw-disable-plugin",
-        action="store_true",
-        help="Disable automatic SOMA context-engine plugin setup for OpenClaw.",
-    )
-    parser.add_argument(
-        "--openclaw-plugin-reinstall-on-run-start",
-        action="store_true",
-        help="Recreate the SOMA plugin Python environment once at the start of this benchmark process.",
-    )
-    parser.add_argument(
-        "--copilot-compression-script-path",
-        default=None,
-        help=(
-            "Optional path to compressor script mounted into compression-service as /app/miner/base_miner.py. "
-            "If omitted, backend falls back to src/compression_service/app/base_miner.py."
-        ),
-    )
-    parser.add_argument(
-        "--copilot-compression-service-autobuild",
-        action="store_true",
-        help=(
-            "Build compression-service image before each Copilot run when compression-service is enabled. "
-            "Uses src/compression_service by default."
-        ),
-    )
-    parser.add_argument(
-        "--copilot-compression-service-build-context",
-        default=None,
-        help=(
-            "Optional docker build context for compression-service autobuild. "
-            "Defaults to src/compression_service."
-        ),
-    )
-    parser.add_argument(
-        "--claude-code-permission-mode",
-        default=None,
-        help=(
-            "Claude Code permission mode (default bypassPermissions - a benchmark run has "
-            "nobody to answer a prompt)."
-        ),
-    )
-    parser.add_argument(
-        "--claude-code-max-turns",
-        type=int,
-        default=None,
-        help="Turn ceiling for Claude Code. Unlimited by default, like Copilot.",
-    )
-    parser.add_argument(
-        "--claude-code-disallowed-tools",
-        default=None,
-        help=(
-            "Comma-separated tools to deny Claude Code, replacing the backend's default "
-            "deny list (Workflow, Cron*, and other session-management tools). Pass an "
-            "empty string to allow all of them."
-        ),
-    )
-    parser.add_argument(
-        "--copilot-use-host-docker-socket",
-        action="store_true",
-        help=(
-            "Legacy/insecure fallback: bridge the Copilot agent to the SWE sandbox by mounting "
-            "the HOST Docker socket directly, instead of the default isolated dind daemon. "
-            "The agent can then see and control every container on the host, not just its own "
-            "sandbox - only use this if the isolated dind daemon does not work in your environment "
-            "(e.g. nested privileged containers are unsupported)."
-        ),
-    )
+    add_harness_arguments(parser)
     parser.add_argument(
         "--benchmark-type",
         choices=list(BENCHMARK_TYPES),
@@ -374,44 +274,6 @@ def build_parser() -> argparse.ArgumentParser:
             "outputs regions read. 'swe_explorer_edit': SWE-Explorer edit mode — agent receives the "
             "ground-truth modified files as a hint and produces a patch."
         ),
-    )
-    parser.add_argument(
-        "--swerebench-eval",
-        action="store_true",
-        help="After agent execution, export the resulting patch and run SWE-rebench evaluation through swebench.harness.",
-    )
-    parser.add_argument(
-        "--swerebench-harness-root",
-        default=None,
-        help="Optional path to a checkout of the SWE-rebench SWE-bench fork used for patch evaluation.",
-    )
-    parser.add_argument(
-        "--swerebench-harness-python",
-        default=None,
-        help="Optional Python executable used to launch swebench.harness.run_evaluation.",
-    )
-    parser.add_argument(
-        "--swerebench-namespace",
-        default=None,
-        help="Optional swebench image namespace override. Use an empty string to force local image builds.",
-    )
-    parser.add_argument(
-        "--swerebench-cache-level",
-        choices=["none", "base", "env", "instance"],
-        default=None,
-        help="Optional cache level forwarded to swebench.harness.run_evaluation.",
-    )
-    parser.add_argument(
-        "--swerebench-timeout",
-        type=int,
-        default=None,
-        help="Optional per-instance evaluation timeout in seconds for swebench.harness.run_evaluation.",
-    )
-    parser.add_argument(
-        "--swerebench-max-workers",
-        type=int,
-        default=None,
-        help="Optional swebench evaluation worker count. Defaults to 1 when enabled.",
     )
     return parser
 
@@ -431,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         model=args.model,
         benchmark_name=args.benchmark,
         selection_id=args.instance_id,
-        ignore_api_key=args.openclaw_ignore_api_key,
+        ignore_api_key=args.ignore_api_key,
     )
 
     if resolved.agent.runtime_backend not in list_runtime_backends():
@@ -467,31 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     image_plan_output_file = output_dir / "image-plan.json"
     eval_output_file = output_dir / "evaluation-summary.json"
 
-    runtime_options = _build_runtime_options(
-        openclaw_command=args.openclaw_command,
-        openclaw_container_image=args.openclaw_container_image,
-        openclaw_current_user=args.openclaw_current_user,
-        openclaw_run_id_header_value=args.openclaw_run_id_header_value,
-        openclaw_ignore_api_key=args.openclaw_ignore_api_key,
-        openclaw_plugin_path=args.openclaw_plugin_path,
-        openclaw_disable_plugin=args.openclaw_disable_plugin,
-        openclaw_plugin_reinstall_on_run_start=args.openclaw_plugin_reinstall_on_run_start,
-        swerebench_eval=args.swerebench_eval,
-        swerebench_split=benchmark_config.split,
-        swerebench_harness_root=args.swerebench_harness_root,
-        swerebench_harness_python=args.swerebench_harness_python,
-        swerebench_namespace=args.swerebench_namespace,
-        swerebench_cache_level=args.swerebench_cache_level,
-        swerebench_timeout=args.swerebench_timeout,
-        swerebench_max_workers=args.swerebench_max_workers,
-        copilot_compression_script_path=args.copilot_compression_script_path,
-        copilot_compression_service_autobuild=args.copilot_compression_service_autobuild,
-        copilot_compression_service_build_context=args.copilot_compression_service_build_context,
-        copilot_use_host_docker_socket=args.copilot_use_host_docker_socket,
-        claude_code_permission_mode=args.claude_code_permission_mode,
-        claude_code_max_turns=args.claude_code_max_turns,
-        claude_code_disallowed_tools=args.claude_code_disallowed_tools,
-    )
+    runtime_options = build_runtime_options(args, swerebench_split=benchmark_config.split)
 
     if args.benchmark_type in (BENCHMARK_TYPE_SWE_EXPLORER_EDIT, BENCHMARK_TYPE_SWE_EXPLORER_EXPLORE):
         _inject_swe_explorer_ground_truth(benchmark_config.runtime_setup_entry, args.instance_id)

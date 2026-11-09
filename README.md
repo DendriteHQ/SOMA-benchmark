@@ -1,65 +1,24 @@
 # SOMA Bench
 
-SOMA Bench runs SWE-bench style tasks through runtime backends (OpenClaw, Copilot and Claude Code) and records runtime artifacts, patch output, token usage, and optional SWE-bench evaluation results.
+SOMA Bench runs SWE-bench style tasks through agent harness backends (Copilot and Claude Code) and records runtime artifacts, patch output, token usage, and optional SWE-bench evaluation results.
 
-The OpenClaw backend can load the SOMA OpenClaw plugin as a context-engine plugin, so benchmark runs can exercise the local SOMA miner during normal OpenClaw execution.
+Pick the harness with `--agent-name` (`benchmark-solve`) or `--runtime-backend` (`benchmark-run-infer`): `copilot` (the `benchmark-run-infer` default) or `claude_code`.
 
-## Run OpenClaw
+## Common options
 
-Expected local layout:
+Both harnesses run on the same runner (`harness_base`), so these flags work the same for each of them:
 
-```text
-docker compose -f src/soma_bench/benchmark/backends/copilot/copilot-cli-container/docker-compose.yml run --rm copilot \
-~/SOMA-plugin
-```
+| Flag | Env var | Purpose |
+|---|---|---|
+| `--run-id-header-value` | `SOMA_RUN_ID_HEADER_VALUE` | Send this run id to the upstream LLM gateway in place of the provider API key; the gateway resolves authorization server-side |
+| `--ignore-api-key` | - | Skip local LLM API key validation (use together with `--run-id-header-value`) |
+| `--compression-script-path` | `SOMA_COMPRESSION_SCRIPT_PATH` | Compressor/miner script mounted into the `compression-service` sidecar |
+| `--compression-service-autobuild` | `SOMA_COMPRESSION_SERVICE_AUTOBUILD` | Rebuild the `compression-service` image before the run |
+| `--compression-service-build-context` | `SOMA_COMPRESSION_SERVICE_BUILD_CONTEXT` | Build context for that rebuild |
+| `--use-host-docker-socket` | `SOMA_USE_HOST_DOCKER_SOCKET` | Insecure fallback: reach the SWE sandbox through the host Docker socket instead of an isolated dind daemon |
 
-Prepare the benchmark repo:
-
-```bash
-cd ~/SOMA-benchmark
-SOMA_COPILOT_COMPOSE_FILE=src/soma_bench/benchmark/backends/copilot/copilot-cli-container/docker-compose.yml
-cp .env.example .env
-```
-
-Edit `.env` with your LLM settings. For example:
-
-
-For standalone OpenRouter runs with OpenClaw and SWE-bench evaluation, set:
-
-```bash
-LLM_MODEL=openrouter/qwen/qwen3-coder
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-COMPACT_BENCH_PLUGIN_TEMPLATE_PATH=/path/to/plugin/SOMA-plugin
-OPENROUTER_API_KEY=...
-```
-
-Optional OpenClaw plugin settings:
-
-```bash
-SOMA_OPENCLAW_PLUGIN_PATH=/path/to/plugin/SOMA-plugin
-SOMA_OPENCLAW_PLUGIN_REINSTALL_ON_RUN_START=true
-```
-
-`SOMA_OPENCLAW_PLUGIN_REINSTALL_ON_RUN_START=true` recreates the plugin Python environment once when a benchmark process starts. It does not reinstall between benchmark tasks in the same run.
-
-Run one benchmark instance directly from its problem statement:
-
-
-Standalone example:
-
-```bash
-source .env && uv run python -m soma_bench benchmark-solve \
-  --agent-name openclaw \
-  --benchmark SWE-bench/SWE-bench_Verified \
-  --instance-id INSTANCE_ID \
-  --benchmark-type swebench_verified \
-  --execute \
-  --openclaw-plugin-path /path/to/plugin/SOMA-plugin \
-  --openclaw-current-user \
-  --openclaw-plugin-reinstall-on-run-start \
-  --openclaw-command "--timeout 3000"
-  --swerebench-eval
-```
+The matching legacy `SOMA_COPILOT_*` env vars (for example `SOMA_COPILOT_COMPRESSION_SCRIPT_PATH`) are
+still read as a fallback after the neutral ones.
 
 `--benchmark-type` selects which task mode the agent runs in. If omitted, it defaults to
 `swebench_verified`. Accepted values:
@@ -71,36 +30,13 @@ source .env && uv run python -m soma_bench benchmark-solve \
 - `swe_explorer_edit` — SWE-Explorer edit mode: the agent receives the ground-truth modified
   files as a hint and must produce a patch.
 
-Run OpenClaw against an existing benchmark manifest:
-
-```bash
-uv run python -m soma_bench benchmark-run-infer \
-  --dataset outputs/benchmark/soma_manifest.jsonl \
-  --runtime-backend openclaw \
-  --workspace docker \
-  --output-dir outputs/soma-bench-local/openclaw \
-  --execute \
-  --openclaw-plugin-path /path/to/plugin/SOMA-plugin \
-  --openclaw-plugin-reinstall-on-run-start \
-  --concurrency 3 \
-  --openclaw-command "--timeout 180"
-```
-
-Results are written to `output.jsonl` inside the selected output directory. SOMA plugin runtime metadata is included in each result row under `metadata.plugin`, and normalized OpenClaw token usage is included under `metadata.token_usage`, including `model_calls_count` and cumulative provider token totals. Plugin artifacts and logs are written under `openclaw-gateway-state/plugin-artifacts`. For OpenClaw, `--concurrency` or `SOMA_BENCHMARK_CONCURRENCY` runs multiple benchmark rows against one run-scoped gateway after installing the SOMA plugin and writing the OpenClaw config once.
-
-To disable the OpenClaw plugin for a comparison run, add:
-
-```bash
---openclaw-disable-plugin
-```
-
 ## Run Copilot
 
 The Copilot backend runs the official `@github/copilot` CLI inside a sandboxed Docker Compose
 stack (`copilot` service + an internal `proxy` sidecar + an optional `compression-service`
 sidecar), pointed at your own LLM endpoint instead of real GitHub Copilot auth
 (`COPILOT_OFFLINE=true` + a custom provider base URL). It works fully standalone — no SOMA
-validator, OpenClaw, or plugin repo required.
+validator or plugin repo required.
 
 ### Prerequisites
 
@@ -183,17 +119,17 @@ uv run python -m soma_bench benchmark-solve \
   --benchmark SWE-bench/SWE-bench_Verified \
   --instance-id INSTANCE_ID \
   --execute \
-  --copilot-compression-script-path /absolute/path/to/your_miner.py \
-  --copilot-compression-service-autobuild \
+  --compression-script-path /absolute/path/to/your_miner.py \
+  --compression-service-autobuild \
   --output-dir outputs/run-copilot-with-compression \
   --swerebench-eval
 ```
 
-- `--copilot-compression-script-path` (or `SOMA_COPILOT_COMPRESSION_SCRIPT_PATH`) is bind-mounted
+- `--compression-script-path` (or `SOMA_COMPRESSION_SCRIPT_PATH`) is bind-mounted
   read-only into the sidecar as `/app/miner/base_miner.py`, overriding the default.
-- `--copilot-compression-service-autobuild` rebuilds the `compression-service` image from
+- `--compression-service-autobuild` rebuilds the `compression-service` image from
   `src/compression_service` before the run — use it whenever `requirements.txt` or the service
-  code (not just your mounted miner script) changed. `--copilot-compression-service-build-context`
+  code (not just your mounted miner script) changed. `--compression-service-build-context`
   overrides the build context directory if your service image lives elsewhere.
 - To skip the sidecar entirely (bypass compression, talk to the LLM directly through the proxy),
   set `SOMA_COPILOT_USE_COMPOSE_COMPRESSION_SERVICE=false`.
@@ -218,7 +154,7 @@ env var, which takes precedence over the built-in default.
 | `SOMA_COPILOT_NETWORK_ISOLATION` | `true` | Run the CLI container without direct internet, routed through the proxy sidecar |
 | `SOMA_COPILOT_KEEP_STACK` | `false` | Keep the Compose stack up after the run instead of tearing it down |
 | `SOMA_COPILOT_SWE_SANDBOX` | `true` | Start a read-only sandbox container exposing the task image's repo path (`/testbed` for SWE-bench, `/repo` for SOMA task lists) |
-| `SOMA_COPILOT_USE_HOST_DOCKER_SOCKET` (`--copilot-use-host-docker-socket`) | `false` | By default the SWE sandbox runs inside an isolated `dind` daemon, unreachable from the host and invisible to it. Setting this bridges the agent to the sandbox via the **host** Docker socket instead - the agent then sees and can control every container on the host, not just its own sandbox. Legacy/insecure fallback only; use if the isolated dind daemon doesn't work in your environment. |
+| `SOMA_USE_HOST_DOCKER_SOCKET` (`--use-host-docker-socket`) | `false` | By default the SWE sandbox runs inside an isolated `dind` daemon, unreachable from the host and invisible to it. Setting this bridges the agent to the sandbox via the **host** Docker socket instead - the agent then sees and can control every container on the host, not just its own sandbox. Legacy/insecure fallback only; use if the isolated dind daemon doesn't work in your environment. |
 | `SOMA_COPILOT_SHARED_PROXY` | `true` | Reuse one proxy/compression stack across a batch instead of one per instance |
 
 ### Run SOMA task lists (`tasks-*.jsonl`)
@@ -346,7 +282,7 @@ off the events as they pass.
 | `PROXY_OPENAI_TRANSLATION` | `1` unless the model is Anthropic's | Have the proxy translate Claude Code's Anthropic Messages requests to OpenAI chat completions upstream (and the responses back) |
 
 `SOMA_HARNESS_AGENT_TIMEOUT_SECONDS` (runtime option `harness_agent_timeout_seconds`) is a
-wall-clock ceiling shared by every harness - Copilot, Claude Code and OpenClaw; the run is
+wall-clock ceiling shared by every harness - Copilot and Claude Code; the run is
 reported as `timeout` and patch capture is skipped. It takes precedence over
 `SOMA_COPILOT_AGENT_TIMEOUT_SECONDS`.
 

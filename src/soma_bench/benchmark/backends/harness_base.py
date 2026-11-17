@@ -474,7 +474,7 @@ def _maybe_cleanup_stale_copilot_docker_resources(
     The `finally` block that normally runs `docker compose down --volumes` never fires if the
     process is SIGKILLed mid-run, leaving the dind sidecar (and its multi-GB nested image
     storage in an anonymous /var/lib/docker volume) on disk indefinitely. This sweep catches
-    those by age, mirroring the equivalent stale-resource sweep in the openclaw backend.
+    those by age before they consume the host's Docker storage indefinitely.
     """
     cleanup_interval_seconds = _resolve_stale_docker_cleanup_interval_seconds(context)
 
@@ -525,7 +525,8 @@ def _resolve_compression_service_image(context: RuntimeExecutionContext) -> str:
 
 def _resolve_compression_service_autobuild(context: RuntimeExecutionContext) -> bool:
     for value in (
-        _resolve_runtime_option(context, "copilot_compression_service_autobuild"),
+        _resolve_runtime_option(context, "compression_service_autobuild"),
+        os.getenv("SOMA_COMPRESSION_SERVICE_AUTOBUILD"),
         os.getenv("SOMA_COPILOT_COMPRESSION_SERVICE_AUTOBUILD"),
     ):
         option = _coerce_bool_option(value)
@@ -548,7 +549,8 @@ def _resolve_use_compose_compression_service(context: RuntimeExecutionContext) -
 def _resolve_compression_service_build_context(context: RuntimeExecutionContext) -> Path:
     default_path = Path(__file__).resolve().parents[4] / "src" / "compression_service"
     for value in (
-        _resolve_runtime_option(context, "copilot_compression_service_build_context"),
+        _resolve_runtime_option(context, "compression_service_build_context"),
+        os.getenv("SOMA_COMPRESSION_SERVICE_BUILD_CONTEXT"),
         os.getenv("SOMA_COPILOT_COMPRESSION_SERVICE_BUILD_CONTEXT"),
     ):
         if isinstance(value, str) and value.strip():
@@ -562,7 +564,8 @@ def _default_compression_script_path() -> Path:
 
 def _resolve_compression_script_path(context: RuntimeExecutionContext) -> Path:
     for value in (
-        _resolve_runtime_option(context, "copilot_compression_script_path"),
+        _resolve_runtime_option(context, "compression_script_path"),
+        os.getenv("SOMA_COMPRESSION_SCRIPT_PATH"),
         os.getenv("SOMA_COPILOT_COMPRESSION_SCRIPT_PATH"),
     ):
         if isinstance(value, str) and value.strip():
@@ -574,10 +577,10 @@ def _validate_compression_script_path(context: RuntimeExecutionContext) -> Path:
     script_path = _resolve_compression_script_path(context)
     if not script_path.is_file():
         raise RuntimeError(
-            "Copilot compression mode received an invalid compressor script path: "
+            "Compression mode received an invalid compressor script path: "
             f"{script_path}. Expected an existing file. "
-            "Set --copilot-compression-script-path, runtime_options.copilot_compression_script_path, "
-            "or SOMA_COPILOT_COMPRESSION_SCRIPT_PATH."
+            "Set --compression-script-path, runtime_options.compression_script_path, "
+            "or SOMA_COMPRESSION_SCRIPT_PATH."
         )
     return script_path
 
@@ -837,7 +840,8 @@ def _swe_exec_client_path() -> Path:
 
 def _resolve_use_host_docker_socket(context: RuntimeExecutionContext) -> bool:
     for value in (
-        _resolve_runtime_option(context, "copilot_use_host_docker_socket"),
+        _resolve_runtime_option(context, "use_host_docker_socket"),
+        os.getenv("SOMA_USE_HOST_DOCKER_SOCKET"),
         os.getenv("SOMA_COPILOT_USE_HOST_DOCKER_SOCKET"),
     ):
         option = _coerce_bool_option(value)
@@ -1129,9 +1133,10 @@ def _resolve_proxy_port(context: RuntimeExecutionContext, *, proxy_service: str)
     return COPILOT_DEFAULT_PROXY_PORT
 
 
-def _resolve_copilot_run_id_header_value(context: RuntimeExecutionContext) -> str:
+def _resolve_run_id_header_value(context: RuntimeExecutionContext) -> str:
     for value in (
-        _resolve_runtime_option(context, "copilot_run_id_header_value"),
+        _resolve_runtime_option(context, "run_id_header_value"),
+        os.getenv("SOMA_RUN_ID_HEADER_VALUE"),
         os.getenv("SOMA_COPILOT_RUN_ID_HEADER_VALUE"),
     ):
         if isinstance(value, str) and value.strip():
@@ -2483,7 +2488,7 @@ def run_harness_instance(
         )
         proxy_url = f"http://{proxy_service}:{proxy_port}"
     credential: str | None = None
-    run_id_header_value = _resolve_copilot_run_id_header_value(context)
+    run_id_header_value = _resolve_run_id_header_value(context)
     if run_id_header_value:
         # For gateway mode, provider-facing auth is replaced with run_id and resolved server-side.
         # Keep this on the agent run container only; avoid mutating shared proxy container env per run.

@@ -19,86 +19,170 @@ def _append_jsonl_row(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=True) + "\n")
 
 
-def _build_runtime_options(
-    *,
-    openclaw_command: str | None,
-    openclaw_container_image: str | None,
-    openclaw_current_user: bool,
-    openclaw_run_id_header_value: str | None,
-    openclaw_ignore_api_key: bool,
-    openclaw_plugin_path: str | None,
-    openclaw_disable_plugin: bool,
-    openclaw_plugin_reinstall_on_run_start: bool,
-    swerebench_eval: bool,
-    swerebench_split: str | None,
-    swerebench_harness_root: str | None,
-    swerebench_harness_python: str | None,
-    swerebench_namespace: str | None,
-    swerebench_cache_level: str | None,
-    swerebench_timeout: int | None,
-    swerebench_max_workers: int | None,
-    copilot_compression_script_path: str | None,
-    copilot_compression_service_autobuild: bool,
-    copilot_compression_service_build_context: str | None,
-    copilot_use_host_docker_socket: bool = False,
-    claude_code_permission_mode: str | None = None,
-    claude_code_max_turns: int | None = None,
-    claude_code_disallowed_tools: str | None = None,
-) -> dict[str, Any]:
+def add_harness_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register CLI flags shared by every agent harness (run-infer and solve).
+
+    Flag names are harness-neutral: every harness runs on the same runner and reads them the same way.
+    """
+    parser.add_argument(
+        "--run-id-header-value",
+        dest="run_id_header_value",
+        default=None,
+        help=(
+            "Optional run id forwarded to the upstream LLM gateway in place of the provider API key. "
+            "The gateway resolves authorization for the run server-side."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-api-key",
+        dest="ignore_api_key",
+        action="store_true",
+        help=(
+            "Skip local LLM API key validation. Use with --run-id-header-value when the upstream "
+            "gateway resolves authorization server-side."
+        ),
+    )
+    parser.add_argument(
+        "--compression-script-path",
+        dest="compression_script_path",
+        default=None,
+        help=(
+            "Optional path to compressor script mounted into compression-service as /app/miner/base_miner.py. "
+            "If omitted, the harness falls back to src/compression_service/app/base_miner.py."
+        ),
+    )
+    parser.add_argument(
+        "--compression-service-autobuild",
+        dest="compression_service_autobuild",
+        action="store_true",
+        help=(
+            "Build compression-service image before each run when compression-service is enabled. "
+            "Uses src/compression_service by default."
+        ),
+    )
+    parser.add_argument(
+        "--compression-service-build-context",
+        dest="compression_service_build_context",
+        default=None,
+        help=(
+            "Optional docker build context for compression-service autobuild. "
+            "Defaults to src/compression_service."
+        ),
+    )
+    parser.add_argument(
+        "--use-host-docker-socket",
+        dest="use_host_docker_socket",
+        action="store_true",
+        help=(
+            "Legacy/insecure fallback: bridge the agent to the SWE sandbox by mounting "
+            "the HOST Docker socket directly, instead of the default isolated dind daemon. "
+            "The agent can then see and control every container on the host, not just its own "
+            "sandbox - only use this if the isolated dind daemon does not work in your environment "
+            "(e.g. nested privileged containers are unsupported)."
+        ),
+    )
+    parser.add_argument(
+        "--claude-code-permission-mode",
+        default=None,
+        help=(
+            "Claude Code permission mode (default bypassPermissions - a benchmark run has "
+            "nobody to answer a prompt)."
+        ),
+    )
+    parser.add_argument(
+        "--claude-code-max-turns",
+        type=int,
+        default=None,
+        help="Turn ceiling for Claude Code. Unlimited by default, like Copilot.",
+    )
+    parser.add_argument(
+        "--claude-code-disallowed-tools",
+        default=None,
+        help=(
+            "Comma-separated tools to deny Claude Code, replacing the backend's default "
+            "deny list (Workflow, Cron*, and other session-management tools). Pass an "
+            "empty string to allow all of them."
+        ),
+    )
+    parser.add_argument(
+        "--swerebench-eval",
+        action="store_true",
+        help="After agent execution, export the resulting patch and run SWE-rebench evaluation through swebench.harness.",
+    )
+    parser.add_argument(
+        "--swerebench-harness-root",
+        default=None,
+        help="Optional path to a checkout of the SWE-rebench SWE-bench fork used for patch evaluation.",
+    )
+    parser.add_argument(
+        "--swerebench-harness-python",
+        default=None,
+        help="Optional Python executable used to launch swebench.harness.run_evaluation.",
+    )
+    parser.add_argument(
+        "--swerebench-namespace",
+        default=None,
+        help="Optional swebench image namespace override. Use an empty string to force local image builds.",
+    )
+    parser.add_argument(
+        "--swerebench-cache-level",
+        choices=["none", "base", "env", "instance"],
+        default=None,
+        help="Optional cache level forwarded to swebench.harness.run_evaluation.",
+    )
+    parser.add_argument(
+        "--swerebench-timeout",
+        type=int,
+        default=None,
+        help="Optional per-instance evaluation timeout in seconds for swebench.harness.run_evaluation.",
+    )
+    parser.add_argument(
+        "--swerebench-max-workers",
+        type=int,
+        default=None,
+        help="Optional swebench evaluation worker count. Defaults to 1 when enabled.",
+    )
+
+
+def build_runtime_options(args: argparse.Namespace, *, swerebench_split: str | None) -> dict[str, Any]:
+    """Translate the flags registered by `add_harness_arguments` into run-plan runtime options."""
     runtime_options: dict[str, Any] = {}
-    if openclaw_command:
-        runtime_options["openclaw_command"] = openclaw_command
-    if openclaw_container_image:
-        runtime_options["openclaw_container_image"] = openclaw_container_image
-    if openclaw_current_user:
-        runtime_options["openclaw_user"] = "current"
-    if openclaw_run_id_header_value:
-        runtime_options["openclaw_run_id_header_value"] = openclaw_run_id_header_value
-        runtime_options["copilot_run_id_header_value"] = openclaw_run_id_header_value
-    if openclaw_ignore_api_key:
-        runtime_options["openclaw_ignore_api_key"] = True
-    if openclaw_plugin_path:
-        runtime_options["openclaw_plugin_path"] = openclaw_plugin_path
-    if openclaw_disable_plugin:
-        runtime_options["openclaw_plugin_enabled"] = False
-    if openclaw_plugin_reinstall_on_run_start:
-        runtime_options["openclaw_plugin_reinstall_on_run_start"] = True
-    if swerebench_eval:
+    if args.run_id_header_value:
+        runtime_options["run_id_header_value"] = args.run_id_header_value
+    if args.swerebench_eval:
         runtime_options["swerebench_eval_enabled"] = True
     if swerebench_split:
         runtime_options["swerebench_split"] = swerebench_split
-    if swerebench_harness_root:
-        runtime_options["swerebench_harness_root"] = swerebench_harness_root
-    if swerebench_harness_python:
-        runtime_options["swerebench_harness_python"] = swerebench_harness_python
-    if swerebench_namespace is not None:
-        runtime_options["swerebench_namespace"] = swerebench_namespace
-    if swerebench_cache_level:
-        runtime_options["swerebench_cache_level"] = swerebench_cache_level
-    if swerebench_timeout is not None:
-        runtime_options["swerebench_timeout"] = swerebench_timeout
-    if swerebench_max_workers is not None:
-        runtime_options["swerebench_max_workers"] = swerebench_max_workers
+    if args.swerebench_harness_root:
+        runtime_options["swerebench_harness_root"] = args.swerebench_harness_root
+    if args.swerebench_harness_python:
+        runtime_options["swerebench_harness_python"] = args.swerebench_harness_python
+    if args.swerebench_namespace is not None:
+        runtime_options["swerebench_namespace"] = args.swerebench_namespace
+    if args.swerebench_cache_level:
+        runtime_options["swerebench_cache_level"] = args.swerebench_cache_level
+    if args.swerebench_timeout is not None:
+        runtime_options["swerebench_timeout"] = args.swerebench_timeout
+    if args.swerebench_max_workers is not None:
+        runtime_options["swerebench_max_workers"] = args.swerebench_max_workers
 
-    if copilot_compression_script_path:
-        runtime_options["copilot_compression_script_path"] = copilot_compression_script_path
-    if copilot_compression_service_autobuild:
-        runtime_options["copilot_compression_service_autobuild"] = True
-    if copilot_compression_service_build_context:
-        runtime_options["copilot_compression_service_build_context"] = (
-            copilot_compression_service_build_context
-        )
-    if copilot_use_host_docker_socket:
-        runtime_options["copilot_use_host_docker_socket"] = True
+    if args.compression_script_path:
+        runtime_options["compression_script_path"] = args.compression_script_path
+    if args.compression_service_autobuild:
+        runtime_options["compression_service_autobuild"] = True
+    if args.compression_service_build_context:
+        runtime_options["compression_service_build_context"] = args.compression_service_build_context
+    if args.use_host_docker_socket:
+        runtime_options["use_host_docker_socket"] = True
 
-    if claude_code_permission_mode:
-        runtime_options["claude_code_permission_mode"] = claude_code_permission_mode
-    if claude_code_max_turns is not None:
-        runtime_options["claude_code_max_turns"] = claude_code_max_turns
+    if args.claude_code_permission_mode:
+        runtime_options["claude_code_permission_mode"] = args.claude_code_permission_mode
+    if args.claude_code_max_turns is not None:
+        runtime_options["claude_code_max_turns"] = args.claude_code_max_turns
     # Not `if ...:` - an empty string is the documented way to clear the backend's own
     # default deny list, and is distinct from the flag being absent.
-    if claude_code_disallowed_tools is not None:
-        runtime_options["claude_code_disallowed_tools"] = claude_code_disallowed_tools
+    if args.claude_code_disallowed_tools is not None:
+        runtime_options["claude_code_disallowed_tools"] = args.claude_code_disallowed_tools
     return runtime_options
 
 
@@ -192,140 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print the inferred run plan without creating any scaffold directories.",
     )
-    parser.add_argument(
-        "--openclaw-command",
-        default=None,
-        help="Optional extra arguments appended to `openclaw agent` inside the OpenClaw CLI sidecar.",
-    )
-    parser.add_argument(
-        "--openclaw-container-image",
-        default=None,
-        help="Optional Docker image override for the shared OpenClaw gateway and CLI sidecars.",
-    )
-    parser.add_argument(
-        "--openclaw-current-user",
-        action="store_true",
-        help=(
-            "Run OpenClaw gateway and CLI containers as the invoking host uid:gid. "
-            "Required unless provided via SOMA_OPENCLAW_USER or SOMA_OPENCLAW_CONTAINER_USER."
-        ),
-    )
-    parser.add_argument(
-        "--openclaw-ignore-api-key",
-        action="store_true",
-        help="Skip local LLM API key validation and do not forward API key credentials to OpenClaw. Use when the upstream gateway resolves auth from X-Run-Id.",
-    )
-    parser.add_argument(
-        "--openclaw-plugin-path",
-        default=None,
-        help="Optional local path to the SOMA OpenClaw plugin repository.",
-    )
-    parser.add_argument(
-        "--openclaw-disable-plugin",
-        action="store_true",
-        help="Disable automatic SOMA context-engine plugin setup for OpenClaw.",
-    )
-    parser.add_argument(
-        "--openclaw-plugin-reinstall-on-run-start",
-        action="store_true",
-        help="Recreate the SOMA plugin Python environment once at the start of this benchmark process.",
-    )
-    parser.add_argument(
-        "--copilot-compression-script-path",
-        default=None,
-        help=(
-            "Optional path to compressor script mounted into compression-service as /app/miner/base_miner.py. "
-            "If omitted, backend falls back to src/compression_service/app/base_miner.py."
-        ),
-    )
-    parser.add_argument(
-        "--copilot-compression-service-autobuild",
-        action="store_true",
-        help=(
-            "Build compression-service image before each Copilot run when compression-service is enabled. "
-            "Uses src/compression_service by default."
-        ),
-    )
-    parser.add_argument(
-        "--copilot-compression-service-build-context",
-        default=None,
-        help=(
-            "Optional docker build context for compression-service autobuild. "
-            "Defaults to src/compression_service."
-        ),
-    )
-    parser.add_argument(
-        "--claude-code-permission-mode",
-        default=None,
-        help=(
-            "Claude Code permission mode (default bypassPermissions - a benchmark run has "
-            "nobody to answer a prompt)."
-        ),
-    )
-    parser.add_argument(
-        "--claude-code-max-turns",
-        type=int,
-        default=None,
-        help="Turn ceiling for Claude Code. Unlimited by default, like Copilot.",
-    )
-    parser.add_argument(
-        "--claude-code-disallowed-tools",
-        default=None,
-        help=(
-            "Comma-separated tools to deny Claude Code, replacing the backend's default "
-            "deny list (Workflow, Cron*, and other session-management tools). Pass an "
-            "empty string to allow all of them."
-        ),
-    )
-    parser.add_argument(
-        "--copilot-use-host-docker-socket",
-        action="store_true",
-        help=(
-            "Legacy/insecure fallback: bridge the Copilot agent to the SWE sandbox by mounting "
-            "the HOST Docker socket directly, instead of the default isolated dind daemon. "
-            "The agent can then see and control every container on the host, not just its own "
-            "sandbox - only use this if the isolated dind daemon does not work in your environment "
-            "(e.g. nested privileged containers are unsupported)."
-        ),
-    )
-    parser.add_argument(
-        "--swerebench-eval",
-        action="store_true",
-        help="After agent execution, export the resulting patch and run SWE-rebench evaluation through swebench.harness.",
-    )
-    parser.add_argument(
-        "--swerebench-harness-root",
-        default=None,
-        help="Optional path to a checkout of the SWE-rebench SWE-bench fork used for patch evaluation.",
-    )
-    parser.add_argument(
-        "--swerebench-harness-python",
-        default=None,
-        help="Optional Python executable used to launch swebench.harness.run_evaluation.",
-    )
-    parser.add_argument(
-        "--swerebench-namespace",
-        default=None,
-        help="Optional swebench image namespace override. Use an empty string to force local image builds.",
-    )
-    parser.add_argument(
-        "--swerebench-cache-level",
-        choices=["none", "base", "env", "instance"],
-        default=None,
-        help="Optional cache level forwarded to swebench.harness.run_evaluation.",
-    )
-    parser.add_argument(
-        "--swerebench-timeout",
-        type=int,
-        default=None,
-        help="Optional per-instance evaluation timeout in seconds for swebench.harness.run_evaluation.",
-    )
-    parser.add_argument(
-        "--swerebench-max-workers",
-        type=int,
-        default=None,
-        help="Optional swebench evaluation worker count. Defaults to 1 when enabled.",
-    )
+    add_harness_arguments(parser)
     args = parser.parse_args(argv)
 
     if args.dry_run and args.execute:
@@ -338,34 +289,10 @@ def main(argv: list[str] | None = None) -> int:
     runtime_backend = get_runtime_backend(args.runtime_backend)
     image = args.image or runtime_backend.default_image
     target = args.target or runtime_backend.default_build_target
-    llm_config = build_llm_config(None, ignore_api_key=args.openclaw_ignore_api_key)
+    llm_config = build_llm_config(None, ignore_api_key=args.ignore_api_key)
     selected_ids = load_selected_instance_ids(args.select) if args.select else None
     instances = load_manifest(args.dataset, limit=args.n_limit, selected_instance_ids=selected_ids)
-    runtime_options = _build_runtime_options(
-        openclaw_command=args.openclaw_command,
-        openclaw_container_image=args.openclaw_container_image,
-        openclaw_current_user=args.openclaw_current_user,
-        openclaw_run_id_header_value=None,
-        openclaw_ignore_api_key=args.openclaw_ignore_api_key,
-        openclaw_plugin_path=args.openclaw_plugin_path,
-        openclaw_disable_plugin=args.openclaw_disable_plugin,
-        openclaw_plugin_reinstall_on_run_start=args.openclaw_plugin_reinstall_on_run_start,
-        swerebench_eval=args.swerebench_eval,
-        swerebench_split=args.split,
-        swerebench_harness_root=args.swerebench_harness_root,
-        swerebench_harness_python=args.swerebench_harness_python,
-        swerebench_namespace=args.swerebench_namespace,
-        swerebench_cache_level=args.swerebench_cache_level,
-        swerebench_timeout=args.swerebench_timeout,
-        swerebench_max_workers=args.swerebench_max_workers,
-        copilot_compression_script_path=args.copilot_compression_script_path,
-        copilot_compression_service_autobuild=args.copilot_compression_service_autobuild,
-        copilot_compression_service_build_context=args.copilot_compression_service_build_context,
-        copilot_use_host_docker_socket=args.copilot_use_host_docker_socket,
-        claude_code_permission_mode=args.claude_code_permission_mode,
-        claude_code_max_turns=args.claude_code_max_turns,
-        claude_code_disallowed_tools=args.claude_code_disallowed_tools,
-    )
+    runtime_options = build_runtime_options(args, swerebench_split=args.split)
     run_plan = build_run_plan(
         instances,
         workspace=args.workspace,

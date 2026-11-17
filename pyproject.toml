@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "soma-bench"
 version = "0.1.0"
-description = "OpenClaw runtime benchmark tooling for SWE-bench style tasks."
+description = "Agent harness benchmark tooling for SWE-bench style tasks."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

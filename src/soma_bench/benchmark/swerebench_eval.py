@@ -15,7 +15,7 @@ from .progress import emit_progress
 DEFAULT_CACHE_LEVEL = "instance"
 DEFAULT_MAX_WORKERS = 1
 DEFAULT_TIMEOUT_SECONDS = 1_800
-OPENCLAW_PATCH_EXCLUDE_PATHS = (
+AGENT_WORKSPACE_PATCH_EXCLUDE_PATHS = (
     ".openclaw",
     "AGENTS.md",
     "BOOTSTRAP.md",
@@ -291,7 +291,7 @@ def capture_repo_patch(
             diff_ref,
             "--",
             ".",
-            *(f":(exclude){path}" for path in OPENCLAW_PATCH_EXCLUDE_PATHS),
+            *(f":(exclude){path}" for path in AGENT_WORKSPACE_PATCH_EXCLUDE_PATHS),
         ]
     )
     patch_text = diff_result.stdout or ""
@@ -384,8 +384,8 @@ def maybe_run_swerebench_evaluation(
         "swerebench_run_id_prefix",
         "SOMA_SWEREBENCH_RUN_ID_PREFIX",
     )
-    run_id_prefix = str(run_id_prefix_value).strip() if run_id_prefix_value else "soma-openclaw"
-    run_id = f"{_slug(run_id_prefix, default='soma-openclaw')}-{_slug(instance_id, default='instance')}"
+    run_id_prefix = str(run_id_prefix_value).strip() if run_id_prefix_value else "soma-bench"
+    run_id = f"{_slug(run_id_prefix, default='soma-bench')}-{_slug(instance_id, default='instance')}"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     emit_progress(
